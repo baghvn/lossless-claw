@@ -683,8 +683,16 @@ function shouldUseNativeCodexBaseUrl(params: {
   provider: string;
   api: string | undefined;
   baseUrl: string | undefined;
+  isExplicitlyConfigured?: boolean;
 }): boolean {
   if (!isOpenAICodexProvider(params.provider) || !isOpenAICodexResponsesApi(params.api)) {
+    return false;
+  }
+
+  // If the user explicitly configured a baseUrl, respect it — don't override
+  // with the native Codex URL. This preserves paid API-key users who set
+  // baseUrl to https://api.openai.com/v1 deliberately.
+  if (params.isExplicitlyConfigured) {
     return false;
   }
 
@@ -709,7 +717,12 @@ function resolveProviderModelBaseUrl(params: {
     typeof params.fallbackBaseUrl === "string" ? params.fallbackBaseUrl : undefined;
   const baseUrl =
     configuredBaseUrl ?? fallbackBaseUrl ?? inferBaseUrlFromProvider(params.provider) ?? "";
-  return shouldUseNativeCodexBaseUrl({ provider: params.provider, api: params.api, baseUrl })
+  return shouldUseNativeCodexBaseUrl({
+    provider: params.provider,
+    api: params.api,
+    baseUrl,
+    isExplicitlyConfigured: configuredBaseUrl !== undefined,
+  })
     ? OPENAI_CODEX_RESPONSES_BASE_URL
     : baseUrl;
 }
