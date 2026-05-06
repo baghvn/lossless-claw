@@ -51,6 +51,12 @@ function createTestConfig(databasePath: string): LcmConfig {
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
+    autoRotateSessionFiles: {
+      enabled: true,
+      sizeBytes: 2 * 1024 * 1024,
+      startup: "rotate",
+      runtime: "rotate",
+    },
     summaryMaxOverageFactor: 3,
     expansionProvider: "",
     expansionModel: "",
@@ -60,10 +66,12 @@ function createTestConfig(databasePath: string): LcmConfig {
     fallbackProviders: [],
     cacheAwareCompaction: {
       enabled: true,
+      cacheTTLSeconds: 300,
       maxColdCacheCatchupPasses: 2,
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
       coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: 0.70,
     },
     dynamicLeafChunkTokens: {
       enabled: true,

@@ -17,6 +17,15 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
   return explicit || join(homedir(), ".openclaw");
 }
 
+/**
+ * Default for `criticalBudgetPressureRatio` — single source of truth so
+ * resolver fallback, runtime fallback, and tests can all reference the same
+ * value. Mirrored to `src/engine.ts`'s `?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO`
+ * usage.
+ */
+export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.70;
+export const DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES = 2 * 1024 * 1024;
+
 export type CacheAwareCompactionConfig = {
   enabled: boolean;
   cacheTTLSeconds: number;
@@ -24,6 +33,26 @@ export type CacheAwareCompactionConfig = {
   hotCachePressureFactor: number;
   hotCacheBudgetHeadroomRatio: number;
   coldCacheObservationThreshold: number;
+  /**
+   * Token-budget ratio that bypasses cache-aware deferral when the prompt is
+   * critically full. Defaults to 0.70 — once `currentTokenCount >= 0.70 *
+   * tokenBudget`, deferred compaction fires regardless of prompt-cache
+   * temperature so the runtime never has to fall back to emergency overflow
+   * truncation.
+   *
+   * The 0.70 default leaves a 30% headroom band (0–70%) where cache-aware
+   * throttling can defer up to the configured cache TTL window per dispatch
+   * (default 5 minutes via `cacheTTLSeconds: 300`).
+   * Above 70%, the bypass fires every turn regardless of cache state — that
+   * 30% buffer is enough room for a heavily-deferred backlog to drain before
+   * the runtime emergency overflow handler is needed. Set to `>= 1` to
+   * disable the bypass entirely (cache-aware throttling fully controls
+   * deferral).
+   *
+   * Optional for backward compatibility — runtime defaults to 0.70 when this
+   * field is absent.
+   */
+  criticalBudgetPressureRatio?: number;
 };
 
 export type DynamicLeafChunkTokensConfig = {
@@ -32,6 +61,14 @@ export type DynamicLeafChunkTokensConfig = {
 };
 
 export type ProactiveThresholdCompactionMode = "deferred" | "inline";
+export type AutoRotateSessionFileMode = "rotate" | "warn" | "off";
+
+export type AutoRotateSessionFilesConfig = {
+  enabled: boolean;
+  sizeBytes: number;
+  startup: AutoRotateSessionFileMode;
+  runtime: AutoRotateSessionFileMode;
+};
 
 export type LcmConfigSource = "env" | "plugin-config" | "default";
 
@@ -95,6 +132,8 @@ export type LcmConfig = {
   transcriptGcEnabled: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
+  /** Automatically rotate LCM-managed session JSONL files that exceed a size ceiling. */
+  autoRotateSessionFiles: AutoRotateSessionFilesConfig;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
   maxAssemblyTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
@@ -198,6 +237,22 @@ function toProactiveThresholdCompactionMode(
   return undefined;
 }
 
+function toAutoRotateSessionFileMode(value: unknown): AutoRotateSessionFileMode | undefined {
+  const normalized = toStr(value)?.toLowerCase();
+  if (normalized === "rotate" || normalized === "warn" || normalized === "off") {
+    return normalized;
+  }
+  return undefined;
+}
+
+/** Coerce a byte threshold to a positive integer. */
+function toPositiveInteger(value: number | undefined): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return Math.max(1, Math.floor(value));
+}
+
 /** Coerce a plugin config value into a trimmed string array when possible. */
 function toStrArray(value: unknown): string[] | undefined {
   if (Array.isArray(value)) {
@@ -283,9 +338,14 @@ export function resolveLcmConfigWithDiagnostics(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
+  const autoRotateSessionFiles = toRecord(pc.autoRotateSessionFiles);
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
   ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
+  const autoRotateSessionFileSizeBytes =
+    toPositiveInteger(parseFiniteInt(env.LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES))
+      ?? toPositiveInteger(toNumber(autoRotateSessionFiles?.sizeBytes))
+      ?? DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES;
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -324,6 +384,18 @@ export function resolveLcmConfigWithDiagnostics(
       parseFiniteNumber(env.LCM_COLD_CACHE_OBSERVATION_THRESHOLD)
         ?? toNumber(cacheAwareCompaction?.coldCacheObservationThreshold)
         ?? 3,
+    ),
+  );
+  // parseFiniteNumber and toNumber both filter out non-finite values, so the
+  // `?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO` fallback always yields a
+  // finite number. Just clamp to [0, 1].
+  const resolvedCriticalBudgetPressureRatio = Math.min(
+    1,
+    Math.max(
+      0,
+      parseFiniteNumber(env.LCM_CRITICAL_BUDGET_PRESSURE_RATIO)
+        ?? toNumber(cacheAwareCompaction?.criticalBudgetPressureRatio)
+        ?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
     ),
   );
 
@@ -427,6 +499,21 @@ export function resolveLcmConfigWithDiagnostics(
           ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
           : toBool(pc.transcriptGcEnabled) ?? false,
       proactiveThresholdCompactionMode,
+      autoRotateSessionFiles: {
+        enabled:
+          env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== undefined
+            ? env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== "false"
+            : toBool(autoRotateSessionFiles?.enabled) ?? true,
+        sizeBytes: autoRotateSessionFileSizeBytes,
+        startup:
+          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_STARTUP)
+            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.startup)
+            ?? "rotate",
+        runtime:
+          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME)
+            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.runtime)
+            ?? "rotate",
+      },
       maxAssemblyTokenBudget:
         parseFiniteInt(env.LCM_MAX_ASSEMBLY_TOKEN_BUDGET)
           ?? toNumber(pc.maxAssemblyTokenBudget) ?? undefined,
@@ -460,6 +547,7 @@ export function resolveLcmConfigWithDiagnostics(
         hotCachePressureFactor: resolvedHotCachePressureFactor,
         hotCacheBudgetHeadroomRatio: resolvedHotCacheBudgetHeadroomRatio,
         coldCacheObservationThreshold: resolvedColdCacheObservationThreshold,
+        criticalBudgetPressureRatio: resolvedCriticalBudgetPressureRatio,
       },
       dynamicLeafChunkTokens: {
         enabled:

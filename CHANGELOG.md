@@ -1,5 +1,108 @@
 # @martian-engineering/lossless-claw
 
+## 0.9.4
+
+### Patch Changes
+
+- [#591](https://github.com/Martian-Engineering/lossless-claw/pull/591) [`f9a5164`](https://github.com/Martian-Engineering/lossless-claw/commit/f9a5164c82f0973a0474396f77a06b210d129f79) Thanks [@coolmanns](https://github.com/coolmanns)! - Fail closed when oversized afterTurn dedup batches have no overlap with the stored LCM tail, preventing short stale runtime snapshots from being imported as fresh duplicate rows.
+
+- [#592](https://github.com/Martian-Engineering/lossless-claw/pull/592) [`e0dbd09`](https://github.com/Martian-Engineering/lossless-claw/commit/e0dbd097bf7ab3116a258b9a13153bd2d682e44f) Thanks [@jalehman](https://github.com/jalehman)! - Automatically rotate oversized LCM-managed session JSONL files by default, with backup-backed rotation, active-session guardrails, startup scans limited to indexed OpenClaw session stores, one startup batch backup, and structured `[lcm] auto-rotate:` summary/detail logs for frequency and byte-savings telemetry.
+
+- [#572](https://github.com/Martian-Engineering/lossless-claw/pull/572) [`1b9ba0c`](https://github.com/Martian-Engineering/lossless-claw/commit/1b9ba0ca1b6cea0d87031e7772fbf1a4225f8978) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix v0.9.3 regressions affecting prefill safety and provider routing:
+
+  - Restore the reference-inequality contract on the no-user-turn assemble fallback. PR [#502](https://github.com/Martian-Engineering/lossless-claw/issues/502)'s guard returned `params.messages` by reference, defeating the `installContextEngineLoopHook` `assembled.messages !== sourceMessages` check installed by PR [#504](https://github.com/Martian-Engineering/lossless-claw/issues/504); the guard now uses the same `safeFallback()` helper as the other fallback paths so the gateway treats the result as assembled context.
+  - Strip assistant messages whose only blocks are blank text (`[{type:"text", text:""}]`) during assembly, complementing the existing thinking-only filter so Bedrock no longer rejects with `The text field in the ContentBlock object at messages.N.content.0 is blank`.
+  - Stop redirecting paid OpenAI API-key Codex users from `https://api.openai.com/v1` to `https://chatgpt.com/backend-api/codex`. `shouldUseNativeCodexBaseUrl` now respects an explicitly-configured baseUrl; the rewrite still applies when baseUrl is empty or already a ChatGPT Codex variant.
+  - Remove the silent `http://localhost:11434` ollama fallback in `inferBaseUrlFromProvider` so cloud-only ollama configs (`https://ollama.com`) and self-hosted setups must be explicit; the prior default would silently route cloud configs to localhost.
+
+- [#574](https://github.com/Martian-Engineering/lossless-claw/pull/574) [`f986c29`](https://github.com/Martian-Engineering/lossless-claw/commit/f986c29ca961e9d878a897e42d5f187ced182bd9) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Tighten packaging guards to prevent the silent-load failure mode [#555](https://github.com/Martian-Engineering/lossless-claw/issues/555) fixed:
+
+  - Add `test/manifest.test.ts` that asserts `openclaw.plugin.json#contracts.tools` matches the canonical `name:` fields exported by `src/tools/lcm-*-tool.ts` (discovered dynamically via directory scan, no hard-coded list) and the `registerTool` call sites in `src/plugin/index.ts` (matcher tolerates both arrow-expression and arrow-block bodies). Catches drift the next time a tool is added or renamed without a manifest update.
+  - Tighten `peerDependencies` for `@mariozechner/pi-*` from `*` to `>=0.66 <1`, and `openclaw` from `*` to `>=2026.2.17 <2026.6.0`, so the next major silently mismatches at install-time rather than at runtime.
+  - Add an upper bound (`<2026.6.0`) and a `tested: ["2026.5.2"]` array to `package.json#openclaw.compat`, so `openclaw plugins doctor` can flag known-incompatible host versions.
+  - Add a CI smoke job that builds the bundle, installs `openclaw@latest` alongside, and verifies the bundle still imports cleanly with a callable `register` export. (A deeper smoke that drives `plugin.register(...)` against a stub api turned out to require more host-runtime fixture than is reasonable to maintain in CI; the deeper "register against the real openclaw plugin loader" check is followup work — see [#555](https://github.com/Martian-Engineering/lossless-claw/issues/555) for the regression class that would warrant it.)
+  - The Windows installer's hook-pack detector ([#451](https://github.com/Martian-Engineering/lossless-claw/issues/451)) already saw `kind: "context-engine"` in the manifest; this is now covered by an explicit assertion in the manifest drift test.
+
+  Closes [#570](https://github.com/Martian-Engineering/lossless-claw/issues/570).
+
+- [#576](https://github.com/Martian-Engineering/lossless-claw/pull/576) [`9f55419`](https://github.com/Martian-Engineering/lossless-claw/commit/9f554194fe04f6e002da3aeab611e893fa92a790) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Harden the afterTurn-lane robustness:
+
+  - `scheduleDeferredCompactionDebtDrain` no longer silently skips when `compactionTelemetry` lacks provider/model — CLI-backend sessions ([#472](https://github.com/Martian-Engineering/lossless-claw/issues/472)) accumulated debt forever. Now drains anyway when telemetry is missing (let the inner cache-aware gate decide), keeping silent debt off the floor. The visibility log is deduped to once per conversation per process so long-running CLI sessions don't spam every afterTurn.
+  - `messageContentCoveredBySummary` (PR [#551](https://github.com/Martian-Engineering/lossless-claw/issues/551)) replaces bare substring match with anchored-or-quoted matching — a 24+ char user instruction coincidentally appearing inside a long narrative summary is no longer silently dropped. The quote-span scan is also more resilient: an unmatched opening quote skips past instead of aborting the entire scan, so later well-formed quoted spans still get checked.
+  - `reconcileTranscriptTailForAfterTurn` (PR [#551](https://github.com/Martian-Engineering/lossless-claw/issues/551)) slow path no longer blindly re-reads the full session file when checkpoint is missing or path mismatched — refresh checkpoint and switch to incremental reads, with a one-shot warn for visibility. The dedupe set is bounded with FIFO eviction at 4096 entries so hosts churning through many sessions don't accumulate it indefinitely. The empty-`historicalMessages` branch now distinguishes "actually empty file" (size 0 → refresh checkpoint) from "non-empty file but parser failure" (size > 0 → emit warn, skip checkpoint refresh, keep the next afterTurn eligible to retry).
+
+- [#574](https://github.com/Martian-Engineering/lossless-claw/pull/574) [`f986c29`](https://github.com/Martian-Engineering/lossless-claw/commit/f986c29ca961e9d878a897e42d5f187ced182bd9) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Apply ingest protections during bootstrap import — credit to @jalehman for [#510](https://github.com/Martian-Engineering/lossless-claw/pull/510), inadvertently omitted from the v0.9.3 changelog. Bootstrap now routes each imported message through `ingestSingle` so oversized files, images, and tool-results are externalized on first import — peer of [#511](https://github.com/Martian-Engineering/lossless-claw/issues/511) and [#521](https://github.com/Martian-Engineering/lossless-claw/issues/521) which closed [#492](https://github.com/Martian-Engineering/lossless-claw/issues/492). (changesets/changelog-github attributes a changeset to the author of the PR introducing it; this entry exists explicitly to surface @jalehman as the author of [#510](https://github.com/Martian-Engineering/lossless-claw/issues/510) in the next release notes since the original changeset for that PR was never merged.)
+
+- [#593](https://github.com/Martian-Engineering/lossless-claw/pull/593) [`785e467`](https://github.com/Martian-Engineering/lossless-claw/commit/785e467aa03029fb84cc9162f9858b10e42ba18e) Thanks [@jalehman](https://github.com/jalehman)! - Declare startup activation in the OpenClaw plugin manifest so OpenClaw 2026.5.2-era startup/runtime plugin planning loads Lossless Claw before resolving the configured context engine.
+
+## 0.9.3
+
+### Patch Changes
+
+- [#557](https://github.com/Martian-Engineering/lossless-claw/pull/557) [`5a6b11b`](https://github.com/Martian-Engineering/lossless-claw/commit/5a6b11b0a1e1f37a2f095731ed0decad74a70847) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Honor `cacheAwareCompaction.enabled: false` at the deferred-compaction dispatch gate, and add a critical-pressure escape so deferred compaction fires regardless of prompt-cache state when `currentTokenCount >= criticalBudgetPressureRatio * tokenBudget` (default 0.70). Previously, mutation-sensitive providers (Anthropic, Codex, Copilot) could livelock the dispatcher in high-velocity sessions: each turn refreshed `lastCacheTouchAt`, the cache TTL never expired, deferred work never fired, and the runtime emergency overflow handler was left to do all the work. The new escape preserves cache-aware throttling in the 0–70% headroom band while ensuring compaction always fires before overflow.
+
+- [#470](https://github.com/Martian-Engineering/lossless-claw/pull/470) [`8d634cd`](https://github.com/Martian-Engineering/lossless-claw/commit/8d634cdf4b7544c9093c2e701fbbe5075d1e3de6) Thanks [@GodsBoy](https://github.com/GodsBoy)! - Document `lcm-tui` Codex OAuth flows with the explicit `openai-codex` provider so repair, rewrite, doctor, and backfill examples match the new Codex CLI delegate path after `codex login`.
+
+- [#535](https://github.com/Martian-Engineering/lossless-claw/pull/535) [`c8c185b`](https://github.com/Martian-Engineering/lossless-claw/commit/c8c185bb68f768db584c34abfb55b2b578b1b902) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Treat Codex prompt-cache writes and recent cache touches as mutation-sensitive so deferred compaction does not rewrite hot cached prompts before the cache TTL expires.
+
+- [#549](https://github.com/Martian-Engineering/lossless-claw/pull/549) [`d8a7389`](https://github.com/Martian-Engineering/lossless-claw/commit/d8a73890933f2992dc997b0dea6a1e193e364d37) Thanks [@jalehman](https://github.com/jalehman)! - Fix `openai-codex` summarization for modern Codex model ids that are not present in the local `pi-ai` model catalog.
+
+  Lossless now resolves native Codex transport defaults for these models and treats explicit provider error responses as provider failures, allowing configured fallback models to run instead of retrying as an empty summary and falling back to truncation.
+
+- [#513](https://github.com/Martian-Engineering/lossless-claw/pull/513) [`4724d3f`](https://github.com/Martian-Engineering/lossless-claw/commit/4724d3fe6ccfd85f275aad732f3b01551d909e5a) Thanks [@mvanhorn](https://github.com/mvanhorn)! - Correct `lcm_expand_query` source-token accounting guidance for explicit leaf summaries.
+
+- [#555](https://github.com/Martian-Engineering/lossless-claw/pull/555) [`4ea5a99`](https://github.com/Martian-Engineering/lossless-claw/commit/4ea5a99769238143e4a62c3b8797ffd56dd666c0) Thanks [@jeremyheslop](https://github.com/jeremyheslop)! - Declare `contracts.tools` in `openclaw.plugin.json` so OpenClaw 2026.5.2's stricter loader accepts the plugin's `lcm_grep`, `lcm_describe`, `lcm_expand`, and `lcm_expand_query` registrations. Without this declaration the loader emits `plugin must declare contracts.tools before registering agent tools` and the plugin fails to register, which silently disables compaction (the engine still loads but no tools are wired up).
+
+- [#546](https://github.com/Martian-Engineering/lossless-claw/pull/546) [`a4f7059`](https://github.com/Martian-Engineering/lossless-claw/commit/a4f7059a6e50f75e916f688070d2172043627464) Thanks [@baghvn](https://github.com/baghvn)! - Resolve uncataloged DeepSeek and other known provider models to their expected API family and base URL defaults when OpenClaw model metadata is unavailable.
+
+- [#551](https://github.com/Martian-Engineering/lossless-claw/pull/551) [`acb5643`](https://github.com/Martian-Engineering/lossless-claw/commit/acb5643a4ebd09af3626db1e3f2ce22133314ffd) Thanks [@jalehman](https://github.com/jalehman)! - Reconcile foreground transcript turns before post-turn ingestion so assistant replies cannot be stored without their user prompt.
+
+- [#504](https://github.com/Martian-Engineering/lossless-claw/pull/504) [`7063a1f`](https://github.com/Martian-Engineering/lossless-claw/commit/7063a1f17b7be4cd60fc87563d5dbf9ce125b1c4) Thanks [@EpaL](https://github.com/EpaL)! - Prevent assistant-prefill failures on assemble fallback paths while preserving valid assembled assistant turns.
+
+- [#502](https://github.com/Martian-Engineering/lossless-claw/pull/502) [`74004a4`](https://github.com/Martian-Engineering/lossless-claw/commit/74004a4ef486ba2e351a4143acfb8cb4a7573b6c) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Fix prefill errors on cold-cache new sessions that start with only an assistant greeting.
+
+  When a session begins with an agent greeting before any user message and the Anthropic
+  prompt cache goes cold (>5 min), `assemble()` could return a context containing only
+  the assistant greeting with no user turns. Providers that require conversations to end
+  with a user message would then reject the LLM call, silently dropping the user's first
+  real message.
+
+  `assemble()` now detects when the assembled context contains no user-role messages at
+  all (raw-message-only DB state where every stored message is `assistant` or `toolResult`)
+  and falls back to the live context, which correctly ends with the user's current message.
+  Sessions with compaction summaries are unaffected because summaries are always stored
+  with `role: "user"`.
+
+- [#501](https://github.com/Martian-Engineering/lossless-claw/pull/501) [`ab22632`](https://github.com/Martian-Engineering/lossless-claw/commit/ab2263215877c59738ce3e6d7608274147290aa7) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Move `@mariozechner/pi-agent-core`, `@mariozechner/pi-ai`, and `@mariozechner/pi-coding-agent` from `dependencies` to optional `peerDependencies` so the plugin always resolves them from the host OpenClaw runtime instead of a pinned local copy.
+
+  Previously these packages were pinned as `dependencies` (fixed at `0.66.1`), which caused npm to install a snapshot in the plugin's own `node_modules/`. That snapshot's internal path references (e.g. `provider.runtime-BlZSfz5M.js`) became stale whenever OpenClaw shipped a new build that bumped `pi-*`, breaking plugin registration on `openclaw ≥ 2026.4.20`.
+
+  By declaring them as optional peer dependencies:
+
+  - No local copy is installed (npm v7+ skips optional peer deps when they are not required by the consumer), so the host-provided versions are resolved via normal Node.js module lookup.
+  - The build already marks `@mariozechner/*` as external (`--external:"@mariozechner/*"`), so the runtime was always intended to supply these modules.
+  - `devDependencies` retains the pinned `0.66.1` versions so local builds and tests continue to work without needing a live OpenClaw installation.
+
+- [#551](https://github.com/Martian-Engineering/lossless-claw/pull/551) [`acb5643`](https://github.com/Martian-Engineering/lossless-claw/commit/acb5643a4ebd09af3626db1e3f2ce22133314ffd) Thanks [@jalehman](https://github.com/jalehman)! - Skip afterTurn messages whose content is already covered by an auto-compaction summary, preventing safeguard-mode summary re-injection from duplicating user instructions in LCM context.
+
+- [#482](https://github.com/Martian-Engineering/lossless-claw/pull/482) [`8d6c0a1`](https://github.com/Martian-Engineering/lossless-claw/commit/8d6c0a1202b3079d718c47234c65b56b764abefa) Thanks [@banna-commits](https://github.com/banna-commits)! - Fix LCM migration recovery when existing databases are missing the `message_parts` table.
+
+- [#500](https://github.com/Martian-Engineering/lossless-claw/pull/500) [`d3a8bae`](https://github.com/Martian-Engineering/lossless-claw/commit/d3a8bae41c8119c76196d9b399950223d2287d6c) Thanks [@Truck0ff](https://github.com/Truck0ff)! - Prefer model-level runtime `api` declarations over provider and catalog API defaults when dispatching LCM summarizer requests.
+
+- [#521](https://github.com/Martian-Engineering/lossless-claw/pull/521) [`791c591`](https://github.com/Martian-Engineering/lossless-claw/commit/791c5916372680336b7c4a310530ad3b3cf5fa91) Thanks [@jalehman](https://github.com/jalehman)! - Externalize native user image blocks as image files before generic raw payload fallback.
+
+- [#527](https://github.com/Martian-Engineering/lossless-claw/pull/527) [`473b90a`](https://github.com/Martian-Engineering/lossless-claw/commit/473b90a618cd8fdd541d953d69414bb69a494b54) Thanks [@vincentkoc](https://github.com/vincentkoc)! - Declare OpenClaw plugin API compatibility metadata and route plugin SDK type imports through the local compatibility bridge.
+
+- [#506](https://github.com/Martian-Engineering/lossless-claw/pull/506) [`2f7b917`](https://github.com/Martian-Engineering/lossless-claw/commit/2f7b917f9a4239c0a4a29b7d23f7eaf7e15bb838) Thanks [@wujiaming88](https://github.com/wujiaming88)! - Prevent replayed Bedrock transcript tails from being reingested after compaction by matching against the actual stored message tail and treating fully matched suffixes as already stored.
+
+- [#511](https://github.com/Martian-Engineering/lossless-claw/pull/511) [`eb59416`](https://github.com/Martian-Engineering/lossless-claw/commit/eb594167366366a9883c49b3cd30bec354da3f94) Thanks [@jalehman](https://github.com/jalehman)! - Externalize oversized raw message payloads into large file records after existing file, image, and tool-result interceptors run.
+
+- [#515](https://github.com/Martian-Engineering/lossless-claw/pull/515) [`1c7b13f`](https://github.com/Martian-Engineering/lossless-claw/commit/1c7b13fcdacace9a9446d357c360fb9d4313c952) Thanks [@SweetSophia](https://github.com/SweetSophia)! - Use runtime prompt token counts for after-turn compaction decisions when OpenClaw provides usage data, falling back to transcript estimates only when runtime counts are unavailable.
+
+- [#507](https://github.com/Martian-Engineering/lossless-claw/pull/507) [`f2574ed`](https://github.com/Martian-Engineering/lossless-claw/commit/f2574ed9585ebba46b3574d9d2541444766cab19) Thanks [@jalehman](https://github.com/jalehman)! - Drain deferred compaction debt only after foreground after-turn maintenance finishes so background work cannot race bootstrap refreshes or hot prompt-cache paths.
+
+- [#503](https://github.com/Martian-Engineering/lossless-claw/pull/503) [`fd62205`](https://github.com/Martian-Engineering/lossless-claw/commit/fd6220563a3629f19d6e1b6ee2ca490566bc2a57) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Strip provider reasoning and thinking blocks from leaf compaction summarizer input while preserving visible message text.
+
 ## 0.9.2
 
 ### Patch Changes

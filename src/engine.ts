@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
@@ -46,7 +46,10 @@ import {
   parseFileBlocks,
 } from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
-import { describeLcmConfigSource } from "./db/config.js";
+import {
+  DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
+  describeLcmConfigSource,
+} from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { logStartupBannerOnce } from "./startup-banner-log.js";
@@ -68,7 +71,7 @@ import {
 } from "./store/conversation-store.js";
 import { SummaryStore } from "./store/summary-store.js";
 import { createLcmSummarizeFromLegacyParams, LcmProviderAuthError } from "./summarize.js";
-import type { LcmDependencies } from "./types.js";
+import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import {
@@ -139,6 +142,8 @@ type RotateTranscriptRewriteResult = {
   bytesRemoved: number;
   preservedTailMessageCount: number;
 };
+type AutoRotateSessionFilePhase = "startup" | "runtime";
+type AutoRotateSessionFileAction = "rotate" | "warn" | "skip" | "summary";
 type ContextEngineMaintenanceResult = {
   changed: boolean;
   bytesFreed: number;
@@ -183,6 +188,16 @@ function getErrorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+function isMissingFileError(error: unknown): boolean {
+  const code = getErrorCode(error);
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function normalizeSessionFilePathForComparison(filePath: string): string {
+  const trimmed = filePath.trim();
+  return trimmed ? resolvePath(trimmed) : "";
+}
+
 const TRANSCRIPT_GC_BATCH_SIZE = 12;
 const HOT_CACHE_HYSTERESIS_TURNS = 2;
 const DYNAMIC_LEAF_CHUNK_MEDIUM_MULTIPLIER = 1.5;
@@ -191,6 +206,7 @@ const DYNAMIC_ACTIVITY_MEDIUM_UPSHIFT_FACTOR = 0.5;
 const DYNAMIC_ACTIVITY_MEDIUM_DOWNSHIFT_FACTOR = 0.35;
 const DYNAMIC_ACTIVITY_HIGH_UPSHIFT_FACTOR = 1.0;
 const DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR = 0.75;
+const AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1073,8 +1089,24 @@ function toDbRole(role: string): "user" | "assistant" | "system" | "tool" {
   if (role === "assistant") {
     return "assistant";
   }
-  // Unknown roles are preserved via message_parts metadata and treated as assistant.
+  // Direct callers should filter unknown roles before storage. Preserve the
+  // historical fallback for typed AgentMessage values that reach this helper.
   return "assistant";
+}
+
+function hasPersistableMessageRole(message: AgentMessage): boolean {
+  const role = (message as { role?: unknown }).role;
+  return (
+    role === "user" ||
+    role === "assistant" ||
+    role === "system" ||
+    role === "tool" ||
+    role === "toolResult"
+  );
+}
+
+function filterPersistableMessages(messages: AgentMessage[]): AgentMessage[] {
+  return messages.filter(hasPersistableMessageRole);
 }
 
 type StoredMessage = {
@@ -1617,6 +1649,23 @@ export type RotateSessionStorageWithBackupResult =
       backupPath?: string;
     };
 
+type StartupAutoRotateCandidate = {
+  sessionId: string;
+  sessionKey: string;
+  sessionFile: string;
+  conversationId: number;
+  sizeBytes: number;
+  currentMessageCount: number;
+};
+
+type StartupAutoRotateBatchResult = {
+  rotated: number;
+  warned: number;
+  bytesRemoved: number;
+  backupPath?: string;
+  backupCreated: number;
+};
+
 function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | null {
   if (!line) {
     return null;
@@ -1630,6 +1679,59 @@ function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | n
 
 function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
+}
+
+function normalizeSummaryOverlapText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function messageContentCoveredBySummary(params: {
+  message: AgentMessage;
+  summary: string;
+}): boolean {
+  const content = normalizeSummaryOverlapText(toStoredMessage(params.message).content);
+  if (content.length < 24) {
+    return false;
+  }
+  const summary = normalizeSummaryOverlapText(params.summary);
+  if (!summary.includes(content)) {
+    return false;
+  }
+  // Bare substring match is too loose: a 24+ char user instruction can
+  // coincidentally appear inside a long narrative summary and get silently
+  // dropped. Require one of:
+  //   1. content appears at the very start or end of the summary, OR
+  //   2. content appears inside a quoted block — double quotes ("..."),
+  //      single quotes ('...'), or backticks (`...`). All three quote
+  //      styles survive normalization and are emitted by the summarizer
+  //      when it embeds verbatim user text.
+  // Otherwise treat it as a coincidental collision and keep the message.
+  if (summary.startsWith(content) || summary.endsWith(content)) {
+    return true;
+  }
+  // Walk each quote-delimited span (cheap; summaries are bounded) and check
+  // membership. Use double-quoted literals to match the rest of the file.
+  for (const quoteChar of ["\"", "'", "`"]) {
+    let cursor = 0;
+    while (cursor < summary.length) {
+      const open = summary.indexOf(quoteChar, cursor);
+      if (open < 0) break;
+      const close = summary.indexOf(quoteChar, open + 1);
+      if (close < 0) {
+        // Unmatched opening quote: don't break out of the entire scan —
+        // a later well-formed quoted span may still contain the content.
+        // Skip past this lone opener and continue.
+        cursor = open + 1;
+        continue;
+      }
+      const span = summary.slice(open + 1, close);
+      if (span.includes(content)) {
+        return true;
+      }
+      cursor = close + 1;
+    }
+  }
+  return false;
 }
 
 // ── LcmContextEngine ────────────────────────────────────────────────────────
@@ -1663,6 +1765,7 @@ export class LcmContextEngine implements ContextEngine {
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private stableOrphanStrippingOrdinalsByConversation = new Map<number, number>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
+  private oversizedAutoRotateCheckpointByQueueKey = new Map<string, number>();
   private largeFileTextSummarizerResolved = false;
   private largeFileTextSummarizer?: (prompt: string) => Promise<string | null>;
   private deps: LcmDependencies;
@@ -1677,6 +1780,30 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Circuit breaker for compaction auth failures ──
   private circuitBreakerStates = new Map<string, CircuitBreakerState>();
+
+  /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
+   *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
+   *  (same NUL-escape separator pattern as `messageIdentity`). Long-running
+   *  sessions where the bootstrap checkpoint is missing or path-mismatched
+   *  would otherwise pay O(file-size) on every afterTurn; repeated attempts
+   *  for the same unchanged file state are skipped.
+   *
+   *  Bounded with FIFO eviction at `AFTER_TURN_RECONCILE_KEY_CAP` entries
+   *  so hosts churning through many sessions/files don't accumulate this
+   *  map indefinitely. When the cap is exceeded we drop the oldest entry
+   *  (Map iteration order is insertion order in JS); a session whose
+   *  entry eventually evicts may pay the slow path once again, which is
+   *  acceptable since the bound is well above realistic concurrent-session
+   *  counts. */
+  private afterTurnReconcileFullReadStates = new Map<string, { size: number; mtimeMs: number }>();
+  private static readonly AFTER_TURN_RECONCILE_KEY_CAP = 4096;
+
+  /** Per-process dedupe for the `cache-context-unknown` info-level log
+   *  (PR #557 added the diagnostic; on long-running sessions without
+   *  provider telemetry it would otherwise fire every afterTurn that
+   *  records deferred debt). Keyed by conversationId so each session
+   *  emits the visibility log AT MOST ONCE per process. */
+  private cacheContextUnknownLogged = new Set<number>();
 
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
@@ -2159,20 +2286,112 @@ export class LcmContextEngine implements ContextEngine {
     );
   }
 
-  /** Delay prompt-mutating deferred compaction while a mutation-sensitive prompt cache is hot. */
+  /**
+   * Delay prompt-mutating deferred compaction while a mutation-sensitive prompt
+   * cache is hot.
+   *
+   * Two bypass conditions:
+   *
+   * 1. `cacheAwareCompaction.enabled === false` — the operator explicitly
+   *    opted out of cache-aware throttling. Without this check the dispatcher
+   *    would silently keep deferring even though every other cache-aware code
+   *    path correctly respects the flag.
+   *
+   * 2. Critical token-budget pressure — when the prompt is approaching
+   *    overflow we MUST allow compaction regardless of cache state. Otherwise
+   *    high-velocity sessions can livelock the dispatcher: each turn refreshes
+   *    `lastCacheTouchAt`, the TTL window never expires, deferred work never
+   *    fires, and the runtime emergency overflow handler is left to do all
+   *    the work. The default 0.70 threshold (configurable via
+   *    `cacheAwareCompaction.criticalBudgetPressureRatio`) leaves a ~30%
+   *    headroom band (0–70%) where cache-aware throttling still applies;
+   *    above that band the cache hold is broken so deferred compaction can
+   *    drag the prompt back down before the runtime emergency overflow
+   *    handler is needed.
+   */
   private shouldDelayPromptMutatingDeferredCompaction(
     telemetry: ConversationCompactionTelemetryRecord | null,
     now: Date = new Date(),
+    currentTokenCount?: number,
+    tokenBudget?: number,
   ): boolean {
+    // Use explicit `=== false` (not falsy) so undefined/null don't silently
+    // bypass the entire cache-aware gate. With falsy `!enabled`, a config
+    // missing the field altogether (e.g. constructed via partial literal in
+    // a test or downstream caller) would skip cache-aware logic — defense
+    // in depth even though resolveLcmConfig always normalizes `enabled` to
+    // a boolean via `... ?? true`.
+    if (this.config.cacheAwareCompaction.enabled === false) {
+      return false;
+    }
+    if (this.isUnderCriticalBudgetPressure({ currentTokenCount, tokenBudget })) {
+      return false;
+    }
     return this.isPromptCacheMutationSensitiveFamily(telemetry)
       && !this.hasFreshPromptCacheBreak(telemetry)
       && this.isPromptCacheStillHot(telemetry, now);
   }
 
-  /** Keep deferred mutation-sensitive leaf debt moving once the TTL-safe cache hold has expired. */
+  /**
+   * Return true when the live prompt is critically full relative to the
+   * token budget. Used to bypass cache-aware deferral so compaction can fire
+   * before the runtime falls back to emergency overflow truncation.
+   */
+  private isUnderCriticalBudgetPressure(params: {
+    currentTokenCount?: number;
+    tokenBudget?: number;
+  }): boolean {
+    if (
+      typeof params.currentTokenCount !== "number"
+      || !Number.isFinite(params.currentTokenCount)
+      || params.currentTokenCount <= 0
+      || typeof params.tokenBudget !== "number"
+      || !Number.isFinite(params.tokenBudget)
+      || params.tokenBudget <= 0
+    ) {
+      return false;
+    }
+    const ratio =
+      this.config.cacheAwareCompaction.criticalBudgetPressureRatio
+        ?? DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO;
+    // Honor the documented "set to >= 1 to disable" semantics. Without this
+    // explicit no-op, ratio=1 would still bypass deferral once
+    // currentTokenCount >= tokenBudget — which contradicts the help text in
+    // openclaw.plugin.json and the JSDoc on CacheAwareCompactionConfig.
+    if (ratio >= 1) {
+      return false;
+    }
+    // Symmetric guard: ratio <= 0 would make `currentTokenCount >= 0 * budget`
+    // always true once any tokens are observed → silently disables ALL
+    // cache-aware throttling on every dispatch, defeating the gate. Treat
+    // ratio <= 0 as a misconfig and refuse the bypass instead.
+    if (ratio <= 0) {
+      return false;
+    }
+    // Compare against the raw product (not floored) so the bypass triggers
+    // exactly at `currentTokenCount >= ratio * tokenBudget` per the docs.
+    // Using Math.floor here would shift the trigger up to almost 1 token
+    // earlier than documented (e.g. budget=10, ratio=0.85 trips at 8 instead
+    // of 9 because floor(10*0.85)=8.5→8).
+    return params.currentTokenCount >= params.tokenBudget * ratio;
+  }
+
+  /**
+   * Keep deferred mutation-sensitive leaf debt moving once the TTL-safe cache
+   * hold has expired.
+   *
+   * Plumbs `currentTokenCount`/`tokenBudget` through to
+   * `shouldDelayPromptMutatingDeferredCompaction` so the critical-pressure
+   * escape correctly applies to the deferred-leaf path. Without these args,
+   * the gate sees `currentTokenCount === undefined`, the pressure check
+   * short-circuits to `false`, and the system can stay cache-throttled past
+   * critical pressure — recreating the livelock this PR was meant to fix.
+   */
   private shouldForceDeferredPromptCacheLeafCompaction(
     telemetry: ConversationCompactionTelemetryRecord | null,
     leafDecision: IncrementalCompactionDecision,
+    currentTokenCount?: number,
+    tokenBudget?: number,
   ): boolean {
     if (leafDecision.shouldCompact) {
       return false;
@@ -2186,15 +2405,27 @@ export class LcmContextEngine implements ContextEngine {
     if (!this.isPromptCacheMutationSensitiveFamily(telemetry)) {
       return false;
     }
-    return !this.shouldDelayPromptMutatingDeferredCompaction(telemetry);
+    return !this.shouldDelayPromptMutatingDeferredCompaction(
+      telemetry,
+      new Date(),
+      currentTokenCount,
+      tokenBudget,
+    );
   }
 
   /** Use the post-TTL catch-up envelope when stale cache debt must override hot-cache smoothing. */
   private resolveDeferredLeafCompactionExecutionDecision(params: {
     telemetry: ConversationCompactionTelemetryRecord | null;
     leafDecision: IncrementalCompactionDecision;
+    currentTokenCount?: number;
+    tokenBudget?: number;
   }): IncrementalCompactionDecision {
-    if (!this.shouldForceDeferredPromptCacheLeafCompaction(params.telemetry, params.leafDecision)) {
+    if (!this.shouldForceDeferredPromptCacheLeafCompaction(
+      params.telemetry,
+      params.leafDecision,
+      params.currentTokenCount,
+      params.tokenBudget,
+    )) {
       return params.leafDecision;
     }
     return {
@@ -2832,7 +3063,23 @@ export class LcmContextEngine implements ContextEngine {
           await this.compactionTelemetryStore.getConversationCompactionTelemetry(
             params.conversationId,
           );
-        if (this.shouldDelayPromptMutatingDeferredCompaction(telemetry)) {
+        // Apply the assembly cap once and use the SAME capped value for both
+        // the gate's pressure check and `consumeDeferredCompactionDebt`. The
+        // maintain() path was patched for this; the drain path needs symmetric
+        // treatment, otherwise when `maxAssemblyTokenBudget` is configured
+        // smaller than the runtime-supplied budget, the gate evaluates the
+        // pressure ratio against a larger budget than execution actually
+        // enforces — which can let the bypass fail to trip at pressures
+        // execution would consider critical.
+        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+        if (
+          this.shouldDelayPromptMutatingDeferredCompaction(
+            telemetry,
+            new Date(),
+            params.currentTokenCount,
+            cappedTokenBudget,
+          )
+        ) {
           this.deps.log.info(
             `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=hot-cache retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"} debtReason=${maintenance.reason ?? params.reason}`,
           );
@@ -2850,7 +3097,7 @@ export class LcmContextEngine implements ContextEngine {
           conversationId: params.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
-          tokenBudget: params.tokenBudget,
+          tokenBudget: cappedTokenBudget,
           currentTokenCount: params.currentTokenCount,
           legacyParams,
         });
@@ -2937,6 +3184,8 @@ export class LcmContextEngine implements ContextEngine {
                 this.resolveDeferredLeafCompactionExecutionDecision({
                   telemetry,
                   leafDecision,
+                  currentTokenCount: resolvedCurrentTokenCount,
+                  tokenBudget: resolvedTokenBudget,
                 });
               if (!leafDecision.shouldCompact) {
                 const deferredLeafStillNeeded =
@@ -3033,11 +3282,27 @@ export class LcmContextEngine implements ContextEngine {
           await this.compactionTelemetryStore.getConversationCompactionTelemetry(
             params.conversationId,
           );
+        // Apply the assembly cap once and use the SAME capped value for both
+        // the gate's pressure check and consumeDeferredCompactionDebt — same
+        // pattern as drain/maintain. Without this, when maxAssemblyTokenBudget
+        // is configured smaller than the runtime-supplied budget, the gate
+        // evaluates pressure against a larger budget than execution actually
+        // enforces, and the bypass can fail to trip at pressures execution
+        // would consider critical.
+        const cappedTokenBudget = this.applyAssemblyBudgetCap(params.tokenBudget);
+        const normalizedCurrentTokenCount = this.normalizeObservedTokenCount(
+          params.currentTokenCount,
+        );
         const promptOverflowEmergency =
-          (params.currentTokenCount ?? 0) > params.tokenBudget;
+          (normalizedCurrentTokenCount ?? 0) > cappedTokenBudget;
         if (
           promptOverflowEmergency
-          || !this.shouldDelayPromptMutatingDeferredCompaction(telemetry)
+          || !this.shouldDelayPromptMutatingDeferredCompaction(
+            telemetry,
+            new Date(),
+            normalizedCurrentTokenCount,
+            cappedTokenBudget,
+          )
         ) {
           const deferredLegacyParams =
             telemetry?.provider || telemetry?.model
@@ -3050,8 +3315,8 @@ export class LcmContextEngine implements ContextEngine {
             conversationId: params.conversationId,
             sessionId: params.sessionId,
             sessionKey: params.sessionKey,
-            tokenBudget: params.tokenBudget,
-            currentTokenCount: params.currentTokenCount,
+            tokenBudget: cappedTokenBudget,
+            currentTokenCount: normalizedCurrentTokenCount,
             legacyParams: deferredLegacyParams,
           });
           return;
@@ -4496,6 +4761,184 @@ export class LcmContextEngine implements ContextEngine {
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
   }
 
+  private async reconcileTranscriptTailForAfterTurn(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<{ importedMessages: number; blockedByImportCap: boolean }> {
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    return await this.withSessionQueue(
+      queueKey,
+      async () => {
+        const conversation = await this.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (!conversation) {
+          return { importedMessages: 0, blockedByImportCap: false };
+        }
+
+        // OpenClaw can submit the foreground prompt outside the mutable
+        // messages array passed to afterTurn. The transcript has the complete
+        // turn by this point, so reconcile it before accepting assistant-only
+        // deltas from the runtime snapshot.
+        const checkpoint = await this.summaryStore.getConversationBootstrapState(
+          conversation.conversationId,
+        );
+        if (
+          checkpoint &&
+          checkpoint.sessionFilePath === params.sessionFile &&
+          checkpoint.lastProcessedOffset >= 0
+        ) {
+          const appended = await readAppendedLeafPathMessages({
+            sessionFile: params.sessionFile,
+            offset: checkpoint.lastProcessedOffset,
+          });
+          if (appended.canUseAppendOnly) {
+            let importedMessages = 0;
+            for (const message of appended.messages) {
+              const result = await this.ingestSingle({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                message,
+              });
+              if (result.ingested) {
+                importedMessages += 1;
+              }
+            }
+            if (importedMessages > 0) {
+              this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+              this.recordRecentBootstrapImport(
+                conversation.conversationId,
+                importedMessages,
+                "reconciled missing session messages",
+              );
+              await this.refreshBootstrapState({
+                conversationId: conversation.conversationId,
+                sessionFile: params.sessionFile,
+              });
+            }
+            return { importedMessages, blockedByImportCap: false };
+          }
+        }
+
+        // Slow path: checkpoint missing, path mismatched, or non-append-only.
+        // Cap full re-reads only for unchanged file states. If the transcript
+        // changed since the last full read, reconcile again; if it did not,
+        // skip without advancing the checkpoint so stale state can be retried
+        // after a later file change, process restart, or cap eviction.
+        const fullReadKey = `${queueKey}\u0000${params.sessionFile}`;
+        const reason = !checkpoint
+          ? "checkpoint-missing"
+          : checkpoint.sessionFilePath !== params.sessionFile
+            ? "path-mismatch"
+            : "append-only-ineligible";
+        let sessionFileState: { size: number; mtimeMs: number } | undefined;
+        try {
+          const sessionFileStats = await stat(params.sessionFile);
+          sessionFileState = {
+            size: sessionFileStats.size,
+            mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+          };
+        } catch {
+          // Leave undefined: without stat proof, do not use the slow-read cap.
+        }
+        const rememberedFileState = this.afterTurnReconcileFullReadStates.get(fullReadKey);
+        if (
+          rememberedFileState
+          && sessionFileState
+          && rememberedFileState.size === sessionFileState.size
+          && rememberedFileState.mtimeMs === sessionFileState.mtimeMs
+        ) {
+          this.deps.log.info(
+            `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+          );
+          return { importedMessages: 0, blockedByImportCap: false };
+        }
+
+        const rememberSlowReadState = (): void => {
+          if (!sessionFileState) {
+            return;
+          }
+          if (
+            !this.afterTurnReconcileFullReadStates.has(fullReadKey)
+            && this.afterTurnReconcileFullReadStates.size
+              >= LcmContextEngine.AFTER_TURN_RECONCILE_KEY_CAP
+          ) {
+            const oldest = this.afterTurnReconcileFullReadStates.keys().next().value;
+            if (typeof oldest === "string") {
+              this.afterTurnReconcileFullReadStates.delete(oldest);
+            }
+          }
+          this.afterTurnReconcileFullReadStates.set(fullReadKey, sessionFileState);
+        };
+        const slowPathStartedAt = Date.now();
+
+        // Distinguish empty-file from read/parse error: stat the file and
+        // only treat it as "actually empty" when size is 0. A non-zero file
+        // returning empty `historicalMessages` indicates the parser hit an
+        // error (and `readLeafPathMessages` swallows those into `[]`); in
+        // that case we must NOT mark the bootstrap checkpoint as fully
+        // processed, otherwise future afterTurns will skip reconciliation
+        // and we lose messages.
+        const historicalMessages = await readLeafPathMessages(params.sessionFile);
+        if (historicalMessages.length === 0) {
+          if (sessionFileState?.size === 0) {
+            // File is genuinely empty — refresh the checkpoint so the next
+            // afterTurn takes the incremental path.
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
+            rememberSlowReadState();
+          } else {
+            this.deps.log.warn(
+              `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+            );
+          }
+          return { importedMessages: 0, blockedByImportCap: false };
+        }
+        const reconcile = await this.reconcileSessionTail({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          conversationId: conversation.conversationId,
+          historicalMessages,
+        });
+        if (reconcile.blockedByImportCap) {
+          return { importedMessages: 0, blockedByImportCap: true };
+        }
+        if (reconcile.importedMessages > 0) {
+          this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+          this.recordRecentBootstrapImport(
+            conversation.conversationId,
+            reconcile.importedMessages,
+            "reconciled missing session messages",
+          );
+        }
+        // Always refresh the checkpoint after a slow-path read, even when no
+        // messages were imported. This pins the offset to the new sessionFile
+        // so the next afterTurn takes the incremental path instead of paying
+        // for another full re-read on every turn.
+        await this.refreshBootstrapState({
+          conversationId: conversation.conversationId,
+          sessionFile: params.sessionFile,
+        });
+        rememberSlowReadState();
+        this.deps.log.warn(
+          `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
+        );
+        return { importedMessages: reconcile.importedMessages, blockedByImportCap: false };
+      },
+      {
+        operationName: "afterTurnTranscriptReconcile",
+        context: [
+          `session=${params.sessionId}`,
+          ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
+        ].join(" "),
+      },
+    );
+  }
+
   /**
    * Persist bootstrap checkpoint metadata anchored to the current DB frontier.
    *
@@ -4975,6 +5418,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string,
     sessionKey: string | undefined,
     batch: AgentMessage[],
+    options?: { oversizedNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
     if (batch.length === 0) return batch;
 
@@ -5003,6 +5447,7 @@ export class LcmContextEngine implements ContextEngine {
         storedBatch,
         storedMessageCount,
         lastDbMessage,
+        options,
       );
     }
 
@@ -5057,6 +5502,7 @@ export class LcmContextEngine implements ContextEngine {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     storedMessageCount: number,
     lastDbMessage: { role: string; content: string },
+    options?: { oversizedNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
     const lastBatchIdentity = messageIdentity(
       storedBatch[storedBatch.length - 1]!.role,
@@ -5093,13 +5539,18 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    // Fall back to suffix matching.
+    // Fall back to suffix matching. If the DB is already longer than the
+    // incoming afterTurn batch and no suffix overlap exists, fail closed:
+    // importing the whole short batch as new would duplicate/pollute LCM with
+    // stale runtime tail snapshots. The transcript reconcile path runs before
+    // this and is responsible for importing genuine missing JSONL tail turns.
     return this.deduplicateSuffixFallback(
       conversationId,
       batch,
       storedBatch,
       storedMessageCount,
       "oversized",
+      { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
     );
   }
 
@@ -5114,6 +5565,7 @@ export class LcmContextEngine implements ContextEngine {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     storedMessageCount: number,
     context: string,
+    options?: { onNoOverlap?: "ingest" | "skip" },
   ): Promise<AgentMessage[]> {
     const allStored = await this.conversationStore.getMessages(conversationId, {
       limit: storedMessageCount,
@@ -5158,6 +5610,14 @@ export class LcmContextEngine implements ContextEngine {
         );
         return newSlice;
       }
+    }
+
+    if (options?.onNoOverlap === "skip") {
+      this.deps.log.warn(
+        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
+          `no overlap found — fail-closed skipping full batch`,
+      );
+      return [];
     }
 
     this.deps.log.warn(
@@ -5210,7 +5670,16 @@ export class LcmContextEngine implements ContextEngine {
     sessionKey?: string;
     runtimeContext?: ContextEngineMaintenanceRuntimeContext;
   }): Promise<ContextEngineMaintenanceResult> {
+    const runRuntimeAutoRotate = async (): Promise<void> => {
+      await this.maybeAutoRotateManagedSessionFile({
+        phase: "runtime",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+      });
+    };
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      await runRuntimeAutoRotate();
       return {
         changed: false,
         bytesFreed: 0,
@@ -5219,6 +5688,7 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     if (this.isStatelessSession(params.sessionKey)) {
+      await runRuntimeAutoRotate();
       return {
         changed: false,
         bytesFreed: 0,
@@ -5231,7 +5701,7 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    return this.withSessionQueue(
+    const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
         const conversation = await this.conversationStore.getConversationForSession({
@@ -5266,8 +5736,25 @@ export class LcmContextEngine implements ContextEngine {
             }
             return 128_000;
           })();
+          // Apply the assembly cap once and use the SAME capped value for both
+          // the gate's pressure check and the actual compaction execution.
+          // Otherwise, when maxAssemblyTokenBudget is configured lower than
+          // the runtime-supplied tokenBudget, the pressure ratio would be
+          // computed against the larger uncapped budget and could fail to
+          // trip even when the prompt is approaching the capped budget that
+          // execution actually enforces.
+          const cappedTokenBudget = this.applyAssemblyBudgetCap(runtimeTokenBudget);
+          const maintainCurrentTokenCount =
+            typeof params.runtimeContext?.currentTokenCount === "number"
+              ? Math.floor(params.runtimeContext.currentTokenCount as number)
+              : undefined;
           if ((maintenance?.pending || maintenance?.running)
-            && this.shouldDelayPromptMutatingDeferredCompaction(telemetry)) {
+            && this.shouldDelayPromptMutatingDeferredCompaction(
+              telemetry,
+              new Date(),
+              maintainCurrentTokenCount,
+              cappedTokenBudget,
+            )) {
             this.deps.log.info(
               `[lcm] maintain: deferred compaction debt still hot-cache deferred conversation=${conversation.conversationId} ${sessionLabel} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
             );
@@ -5276,11 +5763,8 @@ export class LcmContextEngine implements ContextEngine {
               conversationId: conversation.conversationId,
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
-              tokenBudget: this.applyAssemblyBudgetCap(runtimeTokenBudget),
-              currentTokenCount:
-                typeof params.runtimeContext?.currentTokenCount === "number"
-                  ? Math.floor(params.runtimeContext.currentTokenCount as number)
-                  : undefined,
+              tokenBudget: cappedTokenBudget,
+              currentTokenCount: maintainCurrentTokenCount,
               runtimeContext: params.runtimeContext,
               legacyParams: asRecord(params.runtimeContext),
             });
@@ -5402,6 +5886,8 @@ export class LcmContextEngine implements ContextEngine {
       },
       { operationName: "maintain", context: sessionLabel },
     );
+    await runRuntimeAutoRotate();
+    return result;
   }
   private async ingestSingle(params: {
     sessionId: string;
@@ -5411,6 +5897,9 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<IngestResult> {
     const { sessionId, sessionKey, message, isHeartbeat } = params;
     if (isHeartbeat) {
+      return { ingested: false };
+    }
+    if (!hasPersistableMessageRole(message)) {
       return { ingested: false };
     }
 
@@ -5524,6 +6013,25 @@ export class LcmContextEngine implements ContextEngine {
       messageForParts = rawPayloadIntercepted.rewrittenMessage;
       stored = rawPayloadIntercepted.stored;
     }
+
+    // ── Time-window content-hash dedup ────────────────────────────────────────
+    // Prevent duplicate assistant messages caused by sessions_yield() replay.
+    // When the agent produces a message and then yields, the runtime re-persists
+    // the same content into LCM. Skip if the last message in this conversation
+    // has the exact same role + content and was written within the last 60s.
+    if (stored.role === "assistant" || stored.role === "user") {
+      const lastMsg = await this.conversationStore.getLastMessage(conversationId);
+      if (lastMsg && lastMsg.role === stored.role) {
+        const now = Date.now();
+        if (
+          (now - lastMsg.createdAt.getTime()) < 60_000 &&
+          messageIdentity(lastMsg.role, lastMsg.content) === messageIdentity(stored.role, stored.content)
+        ) {
+          return { ingested: false };
+        }
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────────
 
     // Determine next sequence number
     const maxSeq = await this.conversationStore.getMaxSeq(conversationId);
@@ -5720,10 +6228,20 @@ export class LcmContextEngine implements ContextEngine {
     /** Back-compat param name. */
     legacyCompactionParams?: Record<string, unknown>;
   }): Promise<void> {
+    const runRuntimeAutoRotate = async (): Promise<void> => {
+      await this.maybeAutoRotateManagedSessionFile({
+        phase: "runtime",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+      });
+    };
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
+      await runRuntimeAutoRotate();
       return;
     }
     if (this.isStatelessSession(params.sessionKey)) {
+      await runRuntimeAutoRotate();
       return;
     }
     this.ensureMigrated();
@@ -5736,12 +6254,52 @@ export class LcmContextEngine implements ContextEngine {
     // Dedup guard: prevent duplicate ingestion when gateway restart replays
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
     // so synthetic summaries cannot interfere with replay detection.
-    const newMessages = params.messages.slice(params.prePromptMessageCount);
+    const newMessages = filterPersistableMessages(
+      params.messages.slice(params.prePromptMessageCount),
+    );
+    let transcriptReconcileResult = { importedMessages: 0, blockedByImportCap: false };
+    try {
+      transcriptReconcileResult = await this.reconcileTranscriptTailForAfterTurn({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+      });
+    } catch (err) {
+      this.deps.log.warn(
+        `[lcm] afterTurn: transcript reconcile failed for ${sessionLabel}: ${describeLogError(err)}`,
+      );
+    }
     const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
       params.sessionId,
       params.sessionKey,
       newMessages,
+      {
+        oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
+      },
     );
+    const summaryCoveredMessages: AgentMessage[] = [];
+    const summaryDedupedNewMessages: AgentMessage[] = [];
+    if (params.autoCompactionSummary) {
+      for (const message of dedupedNewMessages) {
+        if (
+          messageContentCoveredBySummary({
+            message,
+            summary: params.autoCompactionSummary,
+          })
+        ) {
+          summaryCoveredMessages.push(message);
+        } else {
+          summaryDedupedNewMessages.push(message);
+        }
+      }
+    } else {
+      summaryDedupedNewMessages.push(...dedupedNewMessages);
+    }
+    if (summaryCoveredMessages.length > 0) {
+      this.deps.log.info(
+        `[lcm] afterTurn: skipped ${summaryCoveredMessages.length} messages already covered by autoCompactionSummary ${sessionLabel}`,
+      );
+    }
 
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
@@ -5751,11 +6309,12 @@ export class LcmContextEngine implements ContextEngine {
       } as AgentMessage);
     }
 
-    ingestBatch.push(...dedupedNewMessages);
+    ingestBatch.push(...summaryDedupedNewMessages);
     if (ingestBatch.length === 0) {
       this.deps.log.info(
         `[lcm] afterTurn: nothing to ingest ${sessionLabel} newMessages=${newMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
+      await runRuntimeAutoRotate();
       return;
     }
 
@@ -5771,6 +6330,18 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.error(
         `[lcm] afterTurn: ingest failed, skipping compaction: ${describeLogError(err)}`,
       );
+      this.logAutoRotateSessionFileDecision({
+        phase: "runtime",
+        action: "skip",
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+        thresholdBytes: this.config.autoRotateSessionFiles.sizeBytes,
+        durationMs: 0,
+        reason: "ingest-failed",
+        error: describeLogError(err),
+        level: "warn",
+      });
       return;
     }
 
@@ -5802,6 +6373,7 @@ export class LcmContextEngine implements ContextEngine {
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
+            await runRuntimeAutoRotate();
             return;
           }
         }
@@ -5850,6 +6422,7 @@ export class LcmContextEngine implements ContextEngine {
       this.deps.log.info(
         `[lcm] afterTurn: conversation lookup missed ${sessionLabel} ingestBatch=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
+      await runRuntimeAutoRotate();
       return;
     }
     const refreshAfterTurnBootstrapState = async (): Promise<void> => {
@@ -5969,17 +6542,28 @@ export class LcmContextEngine implements ContextEngine {
           tokenBudget,
           currentTokenCount: observedCurrentTokenCount,
         });
-        if (compactionTelemetry?.provider || compactionTelemetry?.model) {
-          deferredCompactionDrain = {
-            tokenBudget,
-            currentTokenCount: observedCurrentTokenCount,
-            reason: deferredReason,
-          };
-        } else {
-          this.deps.log.info(
-            `[lcm] background deferred compaction not scheduled conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
-          );
+        // CLI-backend sessions (#472) never observe provider/model telemetry,
+        // so the previous gate skipped scheduling and accumulated debt
+        // forever. Schedule the drain unconditionally and let the inner
+        // cache-aware gate (`shouldDelayPromptMutatingDeferredCompaction`)
+        // decide whether prompt mutation is actually safe — that gate is
+        // robust to missing telemetry.
+        if (!compactionTelemetry?.provider && !compactionTelemetry?.model) {
+          // Dedupe the visibility log to once per conversation per process —
+          // long-running CLI-backend sessions otherwise emit this line on
+          // every afterTurn that records deferred debt.
+          if (!this.cacheContextUnknownLogged.has(conversation.conversationId)) {
+            this.cacheContextUnknownLogged.add(conversation.conversationId);
+            this.deps.log.info(
+              `[lcm] background deferred compaction scheduled without cache context conversation=${conversation.conversationId} ${sessionLabel} reason=cache-context-unknown debtReason=${deferredReason}`,
+            );
+          }
         }
+        deferredCompactionDrain = {
+          tokenBudget,
+          currentTokenCount: observedCurrentTokenCount,
+          reason: deferredReason,
+        };
       }
     } catch (err) {
       this.deps.log.warn(
@@ -6005,6 +6589,7 @@ export class LcmContextEngine implements ContextEngine {
     this.deps.log.info(
       `[lcm] afterTurn: done conversation=${conversation.conversationId} ${sessionLabel} newMessages=${newMessages.length} dedupedMessages=${dedupedNewMessages.length} ingestedMessages=${ingestBatch.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
     );
+    await runRuntimeAutoRotate();
   }
 
   async assemble(params: {
@@ -6139,10 +6724,12 @@ export class LcmContextEngine implements ContextEngine {
         this.deps.log.info(
           `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${assembled.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
-        return {
-          messages: params.messages,
-          estimatedTokens: 0,
-        };
+        // Use safeFallback() so the result is a *new* array; otherwise the
+        // gateway's `assembled.messages !== sourceMessages` reference-equality
+        // check falls through to raw sourceMessages (still ending in assistant)
+        // and re-introduces the prefill-rejection bug fixed by safeFallback in
+        // the other early-return paths.
+        return safeFallback();
       }
 
       this.deps.log.info(
@@ -6767,6 +7354,689 @@ export class LcmContextEngine implements ContextEngine {
           });
         }),
     );
+  }
+
+  /** Return the configured auto-rotation mode for the current phase. */
+  private getAutoRotateSessionFileMode(
+    phase: AutoRotateSessionFilePhase,
+  ): "rotate" | "warn" | "off" {
+    return phase === "startup"
+      ? this.config.autoRotateSessionFiles.startup
+      : this.config.autoRotateSessionFiles.runtime;
+  }
+
+  /** Emit one structured, grep-friendly auto-rotation log line. */
+  private logAutoRotateSessionFileDecision(params: {
+    level?: "info" | "warn" | "error";
+    phase: AutoRotateSessionFilePhase;
+    action: AutoRotateSessionFileAction;
+    sessionId?: string;
+    sessionKey?: string;
+    conversationId?: number;
+    sessionFile?: string;
+    sizeBytes?: number;
+    thresholdBytes?: number;
+    durationMs: number;
+    backupPath?: string;
+    bytesRemoved?: number;
+    preservedTailMessageCount?: number;
+    checkpointSize?: number;
+    currentMessageCount?: number;
+    scanned?: number;
+    eligible?: number;
+    rotated?: number;
+    warned?: number;
+    skipped?: number;
+    backupCreated?: number;
+    reason?: string;
+    error?: string;
+  }): void {
+    const fields: Array<[string, string | number | undefined]> = [
+      ["phase", params.phase],
+      ["action", params.action],
+      ["sessionId", params.sessionId],
+      ["sessionKey", params.sessionKey],
+      ["conversationId", params.conversationId],
+      ["sessionFile", params.sessionFile],
+      ["sizeBytes", params.sizeBytes],
+      ["thresholdBytes", params.thresholdBytes],
+      ["durationMs", params.durationMs],
+      ["backupPath", params.backupPath],
+      ["bytesRemoved", params.bytesRemoved],
+      ["preservedTailMessageCount", params.preservedTailMessageCount],
+      ["checkpointSize", params.checkpointSize],
+      ["currentMessageCount", params.currentMessageCount],
+      ["scanned", params.scanned],
+      ["eligible", params.eligible],
+      ["rotated", params.rotated],
+      ["warned", params.warned],
+      ["skipped", params.skipped],
+      ["backupCreated", params.backupCreated],
+      ["reason", params.reason],
+      ["error", params.error],
+    ];
+    const rendered = fields
+      .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
+      .map(([key, value]) => `${key}=${String(value).replace(/\s+/g, "_")}`)
+      .join(" ");
+    const level = params.level ?? "info";
+    this.deps.log[level](`[lcm] auto-rotate: ${rendered}`);
+  }
+
+  /** Check one LCM-managed transcript and rotate it when policy allows. */
+  private async maybeAutoRotateManagedSessionFile(params: {
+    phase: AutoRotateSessionFilePhase;
+    sessionId?: string;
+    sessionKey?: string;
+    sessionFile?: string;
+    conversationId?: number;
+  }): Promise<void> {
+    const startedAt = Date.now();
+    const thresholdBytes = this.config.autoRotateSessionFiles.sizeBytes;
+    const sessionId = params.sessionId?.trim();
+    const sessionKey = params.sessionKey?.trim();
+    const sessionFile = params.sessionFile?.trim();
+    const baseLog = {
+      phase: params.phase,
+      sessionId,
+      sessionKey,
+      conversationId: params.conversationId,
+      sessionFile,
+      thresholdBytes,
+    };
+
+    const skip = (reason: string, sizeBytes?: number): void => {
+      this.logAutoRotateSessionFileDecision({
+        ...baseLog,
+        action: "skip",
+        sizeBytes,
+        durationMs: Date.now() - startedAt,
+        reason,
+      });
+    };
+
+    // Cheap guards first: these must not stat or mutate transcripts for
+    // sessions that LCM does not actively and durably own.
+    if (!this.config.autoRotateSessionFiles.enabled) {
+      skip("disabled");
+      return;
+    }
+    const mode = this.getAutoRotateSessionFileMode(params.phase);
+    if (mode === "off") {
+      skip("mode-off");
+      return;
+    }
+    if (!this.info.ownsCompaction) {
+      skip("engine-unhealthy");
+      return;
+    }
+    if (!sessionId || !sessionKey) {
+      skip("missing-session-identity");
+      return;
+    }
+    if (!sessionFile) {
+      skip("missing-session-file");
+      return;
+    }
+    if (this.shouldIgnoreSession({ sessionId, sessionKey })) {
+      skip("session-excluded");
+      return;
+    }
+    if (this.isStatelessSession(sessionKey)) {
+      skip("stateless-session");
+      return;
+    }
+
+    // The file stat is the only runtime hot-path filesystem work before we
+    // know a rotation is needed.
+    let sizeBytes: number;
+    try {
+      sizeBytes = (await stat(sessionFile)).size;
+    } catch (error) {
+      this.logAutoRotateSessionFileDecision({
+        ...baseLog,
+        action: "warn",
+        durationMs: Date.now() - startedAt,
+        reason: "session-file-stat-failed",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      return;
+    }
+
+    if (sizeBytes <= thresholdBytes) {
+      this.oversizedAutoRotateCheckpointByQueueKey.delete(
+        this.resolveSessionQueueKey(sessionId, sessionKey),
+      );
+      skip("below-threshold", sizeBytes);
+      return;
+    }
+
+    // Reconfirm active LCM ownership after the size check. Startup scans pass a
+    // conversation id; runtime checks resolve the current session identity.
+    let conversation: ConversationRecord | null;
+    try {
+      conversation = params.conversationId !== undefined
+        ? await this.conversationStore.getConversation(params.conversationId)
+        : await this.conversationStore.getConversationForSession({ sessionId, sessionKey });
+    } catch (error) {
+      this.logAutoRotateSessionFileDecision({
+        ...baseLog,
+        action: "warn",
+        sizeBytes,
+        durationMs: Date.now() - startedAt,
+        reason: "conversation-lookup-failed",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      return;
+    }
+    if (!conversation?.active) {
+      skip("no-active-conversation", sizeBytes);
+      return;
+    }
+
+    // If one rotate could not shrink below the threshold, wait for at least one
+    // threshold worth of new growth before trying again. This avoids a turn-by-
+    // turn loop when the preserved tail is itself larger than the configured cap.
+    const queueKey = this.resolveSessionQueueKey(sessionId, sessionKey);
+    const previousOversizedCheckpoint = this.oversizedAutoRotateCheckpointByQueueKey.get(queueKey);
+    if (
+      previousOversizedCheckpoint !== undefined &&
+      sizeBytes < previousOversizedCheckpoint + thresholdBytes
+    ) {
+      skip("previous-rotate-left-file-over-threshold", sizeBytes);
+      return;
+    }
+
+    // Warn mode is operational telemetry only: it proves the policy would have
+    // fired without touching the live transcript.
+    if (mode === "warn") {
+      this.logAutoRotateSessionFileDecision({
+        ...baseLog,
+        action: "warn",
+        conversationId: conversation.conversationId,
+        sizeBytes,
+        durationMs: Date.now() - startedAt,
+        reason: "above-threshold",
+        level: "warn",
+      });
+      return;
+    }
+
+    // The actual write path is intentionally the same backup-backed helper used
+    // by `/lcm rotate` so DB backup, queueing, and checkpoint semantics match.
+    let result: RotateSessionStorageWithBackupResult;
+    try {
+      result = await this.rotateSessionStorageWithBackup({
+        sessionId,
+        sessionKey,
+        sessionFile,
+        lockTimeoutMs: AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS,
+      });
+    } catch (error) {
+      this.logAutoRotateSessionFileDecision({
+        ...baseLog,
+        action: "warn",
+        conversationId: conversation.conversationId,
+        sizeBytes,
+        durationMs: Date.now() - startedAt,
+        reason: "rotate-threw",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      return;
+    }
+
+    if (result.kind === "rotated") {
+      if (result.checkpointSize >= thresholdBytes) {
+        this.oversizedAutoRotateCheckpointByQueueKey.set(queueKey, result.checkpointSize);
+      } else {
+        this.oversizedAutoRotateCheckpointByQueueKey.delete(queueKey);
+      }
+      this.logAutoRotateSessionFileDecision({
+        ...baseLog,
+        action: "rotate",
+        conversationId: result.currentConversationId,
+        sizeBytes,
+        durationMs: Date.now() - startedAt,
+        backupPath: result.backupPath,
+        bytesRemoved: result.bytesRemoved,
+        preservedTailMessageCount: result.preservedTailMessageCount,
+        checkpointSize: result.checkpointSize,
+        currentMessageCount: result.currentMessageCount,
+      });
+      return;
+    }
+
+    this.logAutoRotateSessionFileDecision({
+      ...baseLog,
+      action: "warn",
+      conversationId: result.currentConversationId ?? conversation.conversationId,
+      sizeBytes,
+      durationMs: Date.now() - startedAt,
+      backupPath: result.backupPath,
+      currentMessageCount: result.currentMessageCount,
+      reason: result.kind,
+      error: result.reason,
+      level: "warn",
+    });
+  }
+
+  /** Emit the compact startup auto-rotate summary line. */
+  private logStartupAutoRotateSummary(params: {
+    startedAt: number;
+    thresholdBytes: number;
+    scanned: number;
+    eligible: number;
+    rotated: number;
+    warned: number;
+    skipped: number;
+    bytesRemoved: number;
+    backupPath?: string;
+    backupCreated?: number;
+    reason?: string;
+  }): void {
+    this.logAutoRotateSessionFileDecision({
+      phase: "startup",
+      action: "summary",
+      thresholdBytes: params.thresholdBytes,
+      durationMs: Date.now() - params.startedAt,
+      scanned: params.scanned,
+      eligible: params.eligible,
+      rotated: params.rotated,
+      warned: params.warned,
+      skipped: params.skipped,
+      backupPath: params.backupPath,
+      bytesRemoved: params.bytesRemoved,
+      backupCreated: params.backupCreated,
+      reason: params.reason,
+    });
+  }
+
+  /** Quietly intersect one indexed startup candidate with active LCM ownership. */
+  private async prepareStartupAutoRotateCandidate(params: {
+    candidate: StartupSessionFileCandidate;
+    startedAt: number;
+    thresholdBytes: number;
+  }): Promise<
+    | { kind: "eligible"; candidate: StartupAutoRotateCandidate }
+    | { kind: "skipped" }
+    | { kind: "warned" }
+  > {
+    const sessionId = params.candidate.sessionId?.trim();
+    const sessionKey = params.candidate.sessionKey?.trim();
+    const sessionFile = params.candidate.sessionFile?.trim();
+    if (!sessionId || !sessionKey || !sessionFile) {
+      return { kind: "skipped" };
+    }
+    if (this.shouldIgnoreSession({ sessionId, sessionKey }) || this.isStatelessSession(sessionKey)) {
+      return { kind: "skipped" };
+    }
+
+    let conversation: ConversationRecord | null;
+    try {
+      conversation = await this.conversationStore.getConversationForSession({ sessionId, sessionKey });
+    } catch (error) {
+      this.logAutoRotateSessionFileDecision({
+        phase: "startup",
+        action: "warn",
+        sessionId,
+        sessionKey,
+        sessionFile,
+        thresholdBytes: params.thresholdBytes,
+        durationMs: Date.now() - params.startedAt,
+        reason: "conversation-lookup-failed",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      return { kind: "warned" };
+    }
+    if (!conversation?.active) {
+      return { kind: "skipped" };
+    }
+
+    const bootstrapState = await this.summaryStore.getConversationBootstrapState(
+      conversation.conversationId,
+    );
+    const bootstrapPath = bootstrapState?.sessionFilePath?.trim();
+    if (
+      !bootstrapPath ||
+      normalizeSessionFilePathForComparison(bootstrapPath) !==
+        normalizeSessionFilePathForComparison(sessionFile)
+    ) {
+      return { kind: "skipped" };
+    }
+
+    let sizeBytes: number;
+    try {
+      sizeBytes = (await stat(sessionFile)).size;
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return { kind: "skipped" };
+      }
+      this.logAutoRotateSessionFileDecision({
+        phase: "startup",
+        action: "warn",
+        sessionId,
+        sessionKey,
+        conversationId: conversation.conversationId,
+        sessionFile,
+        thresholdBytes: params.thresholdBytes,
+        durationMs: Date.now() - params.startedAt,
+        reason: "session-file-stat-failed",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      return { kind: "warned" };
+    }
+    if (sizeBytes <= params.thresholdBytes) {
+      this.oversizedAutoRotateCheckpointByQueueKey.delete(
+        this.resolveSessionQueueKey(sessionId, sessionKey),
+      );
+      return { kind: "skipped" };
+    }
+
+    return {
+      kind: "eligible",
+      candidate: {
+        sessionId,
+        sessionKey,
+        sessionFile,
+        conversationId: conversation.conversationId,
+        sizeBytes,
+        currentMessageCount: await this.conversationStore.getMessageCount(conversation.conversationId),
+      },
+    };
+  }
+
+  /** Enter all affected session queues before taking the startup batch DB backup. */
+  private async withStartupAutoRotateSessionQueues<T>(
+    candidates: StartupAutoRotateCandidate[],
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const queueKeys = Array.from(
+      new Set(candidates.map((candidate) => this.resolveSessionQueueKey(candidate.sessionId, candidate.sessionKey))),
+    ).sort();
+    const enter = async (index: number): Promise<T> => {
+      if (index >= queueKeys.length) {
+        return operation();
+      }
+      return this.withSessionQueue(queueKeys[index]!, () => enter(index + 1));
+    };
+    return enter(0);
+  }
+
+  /** Rotate startup candidates with one pre-mutation LCM database backup. */
+  private async rotateStartupAutoRotateBatch(params: {
+    candidates: StartupAutoRotateCandidate[];
+    startedAt: number;
+    thresholdBytes: number;
+  }): Promise<StartupAutoRotateBatchResult> {
+    const empty = (): StartupAutoRotateBatchResult => ({
+      rotated: 0,
+      warned: 0,
+      bytesRemoved: 0,
+      backupCreated: 0,
+    });
+    if (params.candidates.length === 0) {
+      return empty();
+    }
+
+    try {
+      return await this.withStartupAutoRotateSessionQueues(params.candidates, async () =>
+        withExclusiveDatabaseLock(
+          this.db,
+          { timeoutMs: AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS },
+          async () => {
+            if (this.db.isTransaction) {
+              this.logAutoRotateSessionFileDecision({
+                phase: "startup",
+                action: "warn",
+                thresholdBytes: params.thresholdBytes,
+                durationMs: Date.now() - params.startedAt,
+                reason: "database-transaction-active",
+                level: "warn",
+              });
+              return { ...empty(), warned: 1 };
+            }
+
+            let backupPath: string | null = null;
+            try {
+              backupPath = createLcmDatabaseBackup(this.db, {
+                databasePath: this.config.databasePath,
+                label: "rotate",
+                replaceLatest: true,
+              });
+            } catch (error) {
+              this.logAutoRotateSessionFileDecision({
+                phase: "startup",
+                action: "warn",
+                thresholdBytes: params.thresholdBytes,
+                durationMs: Date.now() - params.startedAt,
+                reason: "backup-failed",
+                error: describeLogError(error),
+                level: "warn",
+              });
+              return { ...empty(), warned: 1 };
+            }
+            if (!backupPath) {
+              this.logAutoRotateSessionFileDecision({
+                phase: "startup",
+                action: "warn",
+                thresholdBytes: params.thresholdBytes,
+                durationMs: Date.now() - params.startedAt,
+                reason: "backup-unavailable",
+                level: "warn",
+              });
+              return { ...empty(), warned: 1 };
+            }
+
+            const result: StartupAutoRotateBatchResult = {
+              rotated: 0,
+              warned: 0,
+              bytesRemoved: 0,
+              backupPath,
+              backupCreated: 1,
+            };
+            for (const candidate of params.candidates) {
+              let rotateResult: RotateSessionStorageResult;
+              try {
+                rotateResult = await this.rotateSessionStorageWhileHoldingDatabaseLock({
+                  sessionId: candidate.sessionId,
+                  sessionKey: candidate.sessionKey,
+                  sessionFile: candidate.sessionFile,
+                });
+              } catch (error) {
+                result.warned += 1;
+                this.logAutoRotateSessionFileDecision({
+                  phase: "startup",
+                  action: "warn",
+                  sessionId: candidate.sessionId,
+                  sessionKey: candidate.sessionKey,
+                  conversationId: candidate.conversationId,
+                  sessionFile: candidate.sessionFile,
+                  sizeBytes: candidate.sizeBytes,
+                  thresholdBytes: params.thresholdBytes,
+                  durationMs: Date.now() - params.startedAt,
+                  backupPath,
+                  currentMessageCount: candidate.currentMessageCount,
+                  reason: "rotate-threw",
+                  error: describeLogError(error),
+                  level: "warn",
+                });
+                continue;
+              }
+
+              if (rotateResult.kind === "unavailable") {
+                result.warned += 1;
+                this.logAutoRotateSessionFileDecision({
+                  phase: "startup",
+                  action: "warn",
+                  sessionId: candidate.sessionId,
+                  sessionKey: candidate.sessionKey,
+                  conversationId: candidate.conversationId,
+                  sessionFile: candidate.sessionFile,
+                  sizeBytes: candidate.sizeBytes,
+                  thresholdBytes: params.thresholdBytes,
+                  durationMs: Date.now() - params.startedAt,
+                  backupPath,
+                  currentMessageCount: candidate.currentMessageCount,
+                  reason: "unavailable",
+                  error: rotateResult.reason,
+                  level: "warn",
+                });
+                continue;
+              }
+
+              result.rotated += 1;
+              result.bytesRemoved += rotateResult.bytesRemoved;
+              const queueKey = this.resolveSessionQueueKey(candidate.sessionId, candidate.sessionKey);
+              if (rotateResult.checkpointSize >= params.thresholdBytes) {
+                this.oversizedAutoRotateCheckpointByQueueKey.set(queueKey, rotateResult.checkpointSize);
+              } else {
+                this.oversizedAutoRotateCheckpointByQueueKey.delete(queueKey);
+              }
+              this.logAutoRotateSessionFileDecision({
+                phase: "startup",
+                action: "rotate",
+                sessionId: candidate.sessionId,
+                sessionKey: candidate.sessionKey,
+                conversationId: rotateResult.conversationId,
+                sessionFile: candidate.sessionFile,
+                sizeBytes: candidate.sizeBytes,
+                thresholdBytes: params.thresholdBytes,
+                durationMs: Date.now() - params.startedAt,
+                backupPath,
+                bytesRemoved: rotateResult.bytesRemoved,
+                preservedTailMessageCount: rotateResult.preservedTailMessageCount,
+                checkpointSize: rotateResult.checkpointSize,
+                currentMessageCount: candidate.currentMessageCount,
+              });
+            }
+            return result;
+          },
+        )
+      );
+    } catch (error) {
+      if (error instanceof DatabaseTransactionTimeoutError) {
+        this.logAutoRotateSessionFileDecision({
+          phase: "startup",
+          action: "warn",
+          thresholdBytes: params.thresholdBytes,
+          durationMs: Date.now() - params.startedAt,
+          reason: "database-lock-timeout",
+          error: describeLogError(error),
+          level: "warn",
+        });
+        return { ...empty(), warned: 1 };
+      }
+      throw error;
+    }
+  }
+
+  /** Scan OpenClaw-indexed startup transcripts and rotate oversized active LCM sessions. */
+  async autoRotateManagedSessionFilesAtStartup(): Promise<void> {
+    const startedAt = Date.now();
+    const thresholdBytes = this.config.autoRotateSessionFiles.sizeBytes;
+    const mode = this.getAutoRotateSessionFileMode("startup");
+    const summary = {
+      scanned: 0,
+      eligible: 0,
+      rotated: 0,
+      warned: 0,
+      skipped: 0,
+      bytesRemoved: 0,
+      backupPath: undefined as string | undefined,
+      backupCreated: 0,
+    };
+    const logSummary = (reason?: string): void =>
+      this.logStartupAutoRotateSummary({
+        startedAt,
+        thresholdBytes,
+        ...summary,
+        reason,
+      });
+
+    if (!this.config.autoRotateSessionFiles.enabled || mode === "off") {
+      logSummary(this.config.autoRotateSessionFiles.enabled ? "mode-off" : "disabled");
+      return;
+    }
+    if (!this.info.ownsCompaction) {
+      logSummary("engine-unhealthy");
+      return;
+    }
+    if (!this.deps.listStartupSessionFileCandidates) {
+      logSummary("no-indexed-session-provider");
+      return;
+    }
+
+    this.ensureMigrated();
+    let indexedCandidates: StartupSessionFileCandidate[];
+    try {
+      indexedCandidates = await this.deps.listStartupSessionFileCandidates();
+    } catch (error) {
+      summary.warned += 1;
+      this.logAutoRotateSessionFileDecision({
+        phase: "startup",
+        action: "warn",
+        thresholdBytes,
+        durationMs: Date.now() - startedAt,
+        reason: "candidate-scan-failed",
+        error: describeLogError(error),
+        level: "warn",
+      });
+      logSummary("candidate-scan-failed");
+      return;
+    }
+
+    const rotateCandidates: StartupAutoRotateCandidate[] = [];
+    for (const candidate of indexedCandidates) {
+      summary.scanned += 1;
+      const prepared = await this.prepareStartupAutoRotateCandidate({
+        candidate,
+        startedAt,
+        thresholdBytes,
+      });
+      if (prepared.kind === "eligible") {
+        summary.eligible += 1;
+        if (mode === "warn") {
+          summary.warned += 1;
+          this.logAutoRotateSessionFileDecision({
+            phase: "startup",
+            action: "warn",
+            sessionId: prepared.candidate.sessionId,
+            sessionKey: prepared.candidate.sessionKey,
+            conversationId: prepared.candidate.conversationId,
+            sessionFile: prepared.candidate.sessionFile,
+            sizeBytes: prepared.candidate.sizeBytes,
+            thresholdBytes,
+            durationMs: Date.now() - startedAt,
+            currentMessageCount: prepared.candidate.currentMessageCount,
+            reason: "above-threshold",
+            level: "warn",
+          });
+        } else {
+          rotateCandidates.push(prepared.candidate);
+        }
+      } else if (prepared.kind === "warned") {
+        summary.warned += 1;
+      } else {
+        summary.skipped += 1;
+      }
+    }
+
+    const batch = await this.rotateStartupAutoRotateBatch({
+      candidates: rotateCandidates,
+      startedAt,
+      thresholdBytes,
+    });
+    summary.rotated += batch.rotated;
+    summary.warned += batch.warned;
+    summary.bytesRemoved += batch.bytesRemoved;
+    summary.backupPath = batch.backupPath;
+    summary.backupCreated += batch.backupCreated;
+    logSummary("completed");
   }
 
   /**

@@ -54,6 +54,12 @@ function createTestConfig(databasePath: string): LcmConfig {
     pruneHeartbeatOk: false,
     transcriptGcEnabled: false,
     proactiveThresholdCompactionMode: "deferred",
+    autoRotateSessionFiles: {
+      enabled: true,
+      sizeBytes: 2 * 1024 * 1024,
+      startup: "rotate",
+      runtime: "rotate",
+    },
     summaryMaxOverageFactor: 3,
     customInstructions: "",
     circuitBreakerThreshold: 5,
@@ -66,6 +72,7 @@ function createTestConfig(databasePath: string): LcmConfig {
       hotCachePressureFactor: 4,
       hotCacheBudgetHeadroomRatio: 0.2,
       coldCacheObservationThreshold: 3,
+      criticalBudgetPressureRatio: 0.70,
     },
     dynamicLeafChunkTokens: {
       enabled: true,
@@ -214,6 +221,27 @@ function makeMessage(params: { role?: string; content: unknown }): AgentMessage 
     content: params.content,
     timestamp: Date.now(),
   } as AgentMessage;
+}
+
+function readSessionMessages(sessionFile: string): AgentMessage[] {
+  return SessionManager.open(sessionFile)
+    .getBranch()
+    .filter((entry) => entry.type === "message")
+    .map((entry) => entry.message as AgentMessage);
+}
+
+function createBulkySession(sessionFile: string, messageCount: number): AgentMessage[] {
+  const sm = SessionManager.open(sessionFile);
+  const messages: AgentMessage[] = [];
+  for (let index = 0; index < messageCount; index += 1) {
+    const message = makeMessage({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: [{ type: "text", text: `auto rotate payload ${index} ${"x".repeat(160)}` }],
+    });
+    sm.appendMessage(message);
+    messages.push(message);
+  }
+  return messages;
 }
 
 async function flushImmediate(): Promise<void> {
@@ -3354,6 +3382,502 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(result.reason).toContain("could not rotate the current session transcript");
   });
 
+  it("auto-rotates oversized LCM-managed session files after runtime turns", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-runtime");
+    const messages = createBulkySession(sessionFile, 14);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-runtime-session";
+    const sessionKey = "agent:main:test:auto-rotate-runtime";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+
+    const afterSize = statSync(sessionFile).size;
+    expect(beforeSize).toBeGreaterThan(1_500);
+    expect(afterSize).toBeLessThan(beforeSize);
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    const rotateLog = autoRotateLogs.find((message) =>
+      message.includes("phase=runtime action=rotate"),
+    );
+    expect(rotateLog).toContain(`sessionId=${sessionId}`);
+    expect(rotateLog).toContain(`sessionKey=${sessionKey}`);
+    expect(rotateLog).toContain(`sessionFile=${sessionFile}`);
+    expect(rotateLog).toContain("sizeBytes=");
+    expect(rotateLog).toContain("thresholdBytes=1500");
+    expect(rotateLog).toContain("durationMs=");
+    expect(rotateLog).toContain("backupPath=");
+    expect(rotateLog).toContain("bytesRemoved=");
+    expect(rotateLog).toContain("preservedTailMessageCount=1");
+    expect(rotateLog).toContain("checkpointSize=");
+  });
+
+  it("leaves below-threshold session files alone while logging the decision", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-below-threshold");
+    const messages = createBulkySession(sessionFile, 4);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: beforeSize + 1_000,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-below-session";
+    const sessionKey = "agent:main:test:auto-rotate-below";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+
+    expect(statSync(sessionFile).size).toBe(beforeSize);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("phase=runtime action=skip"),
+        expect.stringContaining("reason=below-threshold"),
+      ]),
+    );
+  });
+
+  it("skips ignored, stateless, and untracked runtime sessions", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-skip-guards");
+    const messages = createBulkySession(sessionFile, 10);
+    const original = readFileSync(sessionFile, "utf8");
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        ignoreSessionPatterns: ["agent:*:cron:**"],
+        statelessSessionPatterns: ["agent:*:subagent:**"],
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+
+    await engine.afterTurn({
+      sessionId: "auto-rotate-ignored-session",
+      sessionKey: "agent:main:cron:nightly",
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    await engine.afterTurn({
+      sessionId: "auto-rotate-stateless-session",
+      sessionKey: "agent:main:subagent:worker",
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    await engine.afterTurn({
+      sessionId: "auto-rotate-untracked-session",
+      sessionKey: "agent:main:test:auto-rotate-untracked",
+      sessionFile,
+      messages: [messages[0]!],
+      prePromptMessageCount: 0,
+      isHeartbeat: true,
+    });
+
+    expect(readFileSync(sessionFile, "utf8")).toBe(original);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("reason=session-excluded"),
+        expect.stringContaining("reason=stateless-session"),
+        expect.stringContaining("reason=no-active-conversation"),
+      ]),
+    );
+  });
+
+  it("startup scan rotates oversized active conversations with checkpointed files", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-startup");
+    const messages = createBulkySession(sessionFile, 14);
+    const beforeSize = statSync(sessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const sessionId = "auto-rotate-startup-session";
+    const sessionKey = "agent:main:test:auto-rotate-startup";
+    const listStartupSessionFileCandidates = vi.fn(async () => [
+      { sessionId, sessionKey, sessionFile },
+    ]);
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      { log, listStartupSessionFileCandidates },
+    );
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    expect(beforeSize).toBeGreaterThan(1_500);
+    expect(statSync(sessionFile).size).toBeLessThan(beforeSize);
+    const autoRotateLogs = log.info.mock.calls.map(([message]) => String(message));
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("phase=startup action=rotate"),
+        expect.stringContaining("backupPath="),
+      ]),
+    );
+    expect(readSessionMessages(sessionFile)).toHaveLength(1);
+    expect(readSessionMessages(sessionFile)[0]?.role).toBe(messages[messages.length - 1]?.role);
+  });
+
+  it("startup scan ignores stale active LCM conversations outside indexed candidates", async () => {
+    const indexedSessionFile = createSessionFilePath("auto-rotate-indexed-startup");
+    const staleSessionFile = createSessionFilePath("auto-rotate-stale-startup");
+    createBulkySession(indexedSessionFile, 14);
+    createBulkySession(staleSessionFile, 14);
+    const indexedBeforeSize = statSync(indexedSessionFile).size;
+    const staleBeforeSize = statSync(staleSessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const indexedSessionId = "auto-rotate-indexed-session";
+    const indexedSessionKey = "agent:main:test:auto-rotate-indexed";
+    const staleSessionId = "auto-rotate-stale-session";
+    const staleSessionKey = "agent:old:test:auto-rotate-stale";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      {
+        log,
+        listStartupSessionFileCandidates: vi.fn(async () => [
+          {
+            sessionId: indexedSessionId,
+            sessionKey: indexedSessionKey,
+            sessionFile: indexedSessionFile,
+          },
+        ]),
+      },
+    );
+
+    await engine.bootstrap({
+      sessionId: indexedSessionId,
+      sessionKey: indexedSessionKey,
+      sessionFile: indexedSessionFile,
+    });
+    await engine.bootstrap({
+      sessionId: staleSessionId,
+      sessionKey: staleSessionKey,
+      sessionFile: staleSessionFile,
+    });
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    expect(statSync(indexedSessionFile).size).toBeLessThan(indexedBeforeSize);
+    expect(statSync(staleSessionFile).size).toBe(staleBeforeSize);
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    expect(autoRotateLogs.filter((message) => message.includes("action=rotate"))).toHaveLength(1);
+    const summaryLog = autoRotateLogs.find((message) => message.includes("action=summary"));
+    expect(summaryLog).toContain("scanned=1");
+    expect(summaryLog).toContain("eligible=1");
+    expect(summaryLog).toContain("rotated=1");
+    expect(summaryLog).toContain("skipped=0");
+  });
+
+  it("startup scan logs one compact summary for quiet skips", async () => {
+    const rotateSessionFile = createSessionFilePath("auto-rotate-summary-rotate");
+    const belowSessionFile = createSessionFilePath("auto-rotate-summary-below");
+    const missingSessionFile = createSessionFilePath("auto-rotate-summary-missing");
+    createBulkySession(rotateSessionFile, 14);
+    createBulkySession(belowSessionFile, 4);
+    const belowThresholdBytes = statSync(belowSessionFile).size + 500;
+    rmSync(missingSessionFile, { force: true });
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const rotateSessionId = "auto-rotate-summary-rotate-session";
+    const rotateSessionKey = "agent:main:test:auto-rotate-summary-rotate";
+    const belowSessionId = "auto-rotate-summary-below-session";
+    const belowSessionKey = "agent:main:test:auto-rotate-summary-below";
+    const missingSessionId = "auto-rotate-summary-missing-session";
+    const missingSessionKey = "agent:main:test:auto-rotate-summary-missing";
+    const noBootstrapSessionId = "auto-rotate-summary-no-bootstrap-session";
+    const noBootstrapSessionKey = "agent:main:test:auto-rotate-summary-no-bootstrap";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: belowThresholdBytes,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      {
+        log,
+        listStartupSessionFileCandidates: vi.fn(async () => [
+          { sessionId: rotateSessionId, sessionKey: rotateSessionKey, sessionFile: rotateSessionFile },
+          { sessionId: belowSessionId, sessionKey: belowSessionKey, sessionFile: belowSessionFile },
+          { sessionId: missingSessionId, sessionKey: missingSessionKey, sessionFile: missingSessionFile },
+          {
+            sessionId: noBootstrapSessionId,
+            sessionKey: noBootstrapSessionKey,
+            sessionFile: createSessionFilePath("auto-rotate-summary-no-bootstrap"),
+          },
+        ]),
+      },
+    );
+
+    await engine.bootstrap({
+      sessionId: rotateSessionId,
+      sessionKey: rotateSessionKey,
+      sessionFile: rotateSessionFile,
+    });
+    await engine.bootstrap({
+      sessionId: belowSessionId,
+      sessionKey: belowSessionKey,
+      sessionFile: belowSessionFile,
+    });
+    const missingConversation = await engine.getConversationStore().createConversation({
+      sessionId: missingSessionId,
+      sessionKey: missingSessionKey,
+    });
+    await engine.getSummaryStore().upsertConversationBootstrapState({
+      conversationId: missingConversation.conversationId,
+      sessionFilePath: missingSessionFile,
+      lastSeenSize: 2_000,
+      lastSeenMtimeMs: Date.now(),
+      lastProcessedOffset: 0,
+    });
+    await engine.getConversationStore().createConversation({
+      sessionId: noBootstrapSessionId,
+      sessionKey: noBootstrapSessionKey,
+    });
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    const autoRotateInfoLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    const autoRotateWarnLogs = log.warn.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    expect(autoRotateInfoLogs.filter((message) => message.includes("action=summary"))).toHaveLength(1);
+    expect(autoRotateInfoLogs.filter((message) => message.includes("action=skip"))).toHaveLength(0);
+    expect(autoRotateWarnLogs).toHaveLength(0);
+    const summaryLog = autoRotateInfoLogs.find((message) => message.includes("action=summary"));
+    expect(summaryLog).toContain("scanned=4");
+    expect(summaryLog).toContain("eligible=1");
+    expect(summaryLog).toContain("rotated=1");
+    expect(summaryLog).toContain("warned=0");
+    expect(summaryLog).toContain("skipped=3");
+  });
+
+  it("startup batch creates one pre-rotation backup for multiple rotations", async () => {
+    const firstSessionFile = createSessionFilePath("auto-rotate-batch-first");
+    const secondSessionFile = createSessionFilePath("auto-rotate-batch-second");
+    createBulkySession(firstSessionFile, 14);
+    createBulkySession(secondSessionFile, 14);
+    const firstBeforeSize = statSync(firstSessionFile).size;
+    const secondBeforeSize = statSync(secondSessionFile).size;
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const firstSessionId = "auto-rotate-batch-first-session";
+    const firstSessionKey = "agent:main:test:auto-rotate-batch-first";
+    const secondSessionId = "auto-rotate-batch-second-session";
+    const secondSessionKey = "agent:main:test:auto-rotate-batch-second";
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "rotate",
+          runtime: "off",
+        },
+      },
+      {
+        log,
+        listStartupSessionFileCandidates: vi.fn(async () => [
+          { sessionId: firstSessionId, sessionKey: firstSessionKey, sessionFile: firstSessionFile },
+          { sessionId: secondSessionId, sessionKey: secondSessionKey, sessionFile: secondSessionFile },
+        ]),
+      },
+    );
+
+    await engine.bootstrap({
+      sessionId: firstSessionId,
+      sessionKey: firstSessionKey,
+      sessionFile: firstSessionFile,
+    });
+    await engine.bootstrap({
+      sessionId: secondSessionId,
+      sessionKey: secondSessionKey,
+      sessionFile: secondSessionFile,
+    });
+    const firstConversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId: firstSessionId, sessionKey: firstSessionKey });
+    const secondConversation = await engine
+      .getConversationStore()
+      .getConversationForSession({ sessionId: secondSessionId, sessionKey: secondSessionKey });
+
+    await engine.autoRotateManagedSessionFilesAtStartup();
+
+    expect(statSync(firstSessionFile).size).toBeLessThan(firstBeforeSize);
+    expect(statSync(secondSessionFile).size).toBeLessThan(secondBeforeSize);
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    const rotateLogs = autoRotateLogs.filter((message) =>
+      message.includes("phase=startup action=rotate"),
+    );
+    expect(rotateLogs).toHaveLength(2);
+    const backupPaths = new Set(
+      rotateLogs.map((message) => message.match(/backupPath=([^ ]+)/)?.[1]).filter(Boolean),
+    );
+    expect(backupPaths.size).toBe(1);
+    const backupPath = Array.from(backupPaths)[0]!;
+    const backupDb = createLcmDatabaseConnection(backupPath);
+    try {
+      const firstBackupState = backupDb
+        .prepare(`SELECT last_seen_size AS lastSeenSize FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .get(firstConversation!.conversationId) as { lastSeenSize: number } | undefined;
+      const secondBackupState = backupDb
+        .prepare(`SELECT last_seen_size AS lastSeenSize FROM conversation_bootstrap_state WHERE conversation_id = ?`)
+        .get(secondConversation!.conversationId) as { lastSeenSize: number } | undefined;
+      expect(firstBackupState?.lastSeenSize).toBe(firstBeforeSize);
+      expect(secondBackupState?.lastSeenSize).toBe(secondBeforeSize);
+    } finally {
+      closeLcmConnection(backupDb);
+    }
+    const summaryLog = autoRotateLogs.find((message) => message.includes("action=summary"));
+    expect(summaryLog).toContain("scanned=2");
+    expect(summaryLog).toContain("eligible=2");
+    expect(summaryLog).toContain("rotated=2");
+    expect(summaryLog).toContain("backupCreated=1");
+  });
+
+  it("does not repeatedly rotate once the transcript has been compacted below threshold", async () => {
+    const sessionFile = createSessionFilePath("auto-rotate-no-loop");
+    const messages = createBulkySession(sessionFile, 14);
+    const log = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 1,
+        autoRotateSessionFiles: {
+          enabled: true,
+          sizeBytes: 1_500,
+          startup: "off",
+          runtime: "rotate",
+        },
+      },
+      { log },
+    );
+    const sessionId = "auto-rotate-no-loop-session";
+    const sessionKey = "agent:main:test:auto-rotate-no-loop";
+
+    await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages,
+      prePromptMessageCount: messages.length,
+    });
+    const compactedMessages = readSessionMessages(sessionFile);
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: compactedMessages,
+      prePromptMessageCount: compactedMessages.length,
+    });
+
+    const autoRotateLogs = log.info.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.startsWith("[lcm] auto-rotate:"));
+    expect(
+      autoRotateLogs.filter((message) => message.includes("action=rotate")),
+    ).toHaveLength(1);
+    expect(autoRotateLogs).toEqual(
+      expect.arrayContaining([expect.stringContaining("reason=below-threshold")]),
+    );
+  });
+
   it("reconciles missing tail messages when JSONL advanced past LCM", async () => {
     const sessionFile = createSessionFilePath("reconcile-tail");
     const sm = SessionManager.open(sessionFile);
@@ -3723,6 +4247,58 @@ describe("LcmContextEngine.bootstrap", () => {
       reason: "reconciled missing session messages",
     });
     expect(reconcileSpy).not.toHaveBeenCalled();
+  });
+
+  it("reconciles foreground transcript messages before assistant-only afterTurn deltas", async () => {
+    const sessionFile = createSessionFilePath("after-turn-foreground-transcript-reconcile");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "kick off workers" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "same status reply" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "after-turn-foreground-transcript-reconcile";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "You set up a monitor too right?" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "same status reply" }],
+    } as AgentMessage);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "same status reply" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "kick off workers",
+      "same status reply",
+      "You set up a monitor too right?",
+      "same status reply",
+    ]);
+
+    const sessionFileStats = statSync(sessionFile);
+    const bootstrapState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(bootstrapState?.lastProcessedOffset).toBe(sessionFileStats.size);
   });
 
   it("falls back to full reconciliation when append-only checkpoint validation mismatches", async () => {
@@ -4583,8 +5159,13 @@ describe("LcmContextEngine.assemble canonical path", () => {
       tokenBudget: 10_000,
     });
 
-    // Should fall back to live context, not return the assistant-only DB context
-    expect(result.messages).toBe(liveMessages);
+    // Should fall back to live context, not return the assistant-only DB context.
+    // The fallback must be a *new* array so the gateway hook's reference-equality
+    // check (`assembled.messages !== sourceMessages`) treats it as assembled —
+    // returning the same reference falls through to raw sourceMessages and
+    // re-introduces the prefill-rejection bug fixed by safeFallback.
+    expect(result.messages).not.toBe(liveMessages);
+    expect(result.messages).toStrictEqual(liveMessages);
     expect(result.estimatedTokens).toBe(0);
   });
 
@@ -5196,6 +5777,62 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[2]?.role).toBe("user");
   });
 
+  it("filters assistant messages with blank-text content during assembly", async () => {
+    // Regression: v0.9.3's #506 added an isThinkingOnlyContent filter for the
+    // Bedrock empty-content rejection, but did not handle the
+    // [{type:"text", text:""}] blank-text shape — Bedrock still rejects with
+    // "The text field in the ContentBlock object at messages.N.content.0 is
+    // blank". The cleanedEntries filter must strip all-blank messages and blank
+    // blocks inside otherwise valid assistant messages.
+    const engine = createEngine();
+    const sessionId = randomUUID();
+
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "Question?" }),
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "   \n\t  " }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "" },
+          { type: "text", text: "Real answer." },
+        ],
+      } as AgentMessage,
+    });
+
+    const assembled = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    expect(assembled.messages).toHaveLength(2);
+    expect(assembled.messages[0]?.role).toBe("user");
+    const assistant = assembled.messages[1] as {
+      role: string;
+      content?: Array<{ type?: string; text?: string }>;
+    };
+    expect(assistant.role).toBe("assistant");
+    expect(assistant.content).toHaveLength(1);
+    expect(assistant.content?.[0]?.text).toBe("Real answer.");
+  });
+
   it("filters thinking-only assistant messages during assembly", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
@@ -5796,22 +6433,18 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(toolResult.content?.[0]?.output).toEqual({ cwd: "/tmp" });
   });
 
-  it("maps unknown roles to assistant instead of silently coercing to user", async () => {
+  it("skips unknown roles instead of storing them as assistant messages", async () => {
     const engine = createEngine();
     const sessionId = randomUUID();
 
-    await engine.ingest({
+    const result = await engine.ingest({
       sessionId,
       message: makeMessage({ role: "custom-event", content: "opaque payload" }),
     });
 
+    expect(result.ingested).toBe(false);
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
-    expect(conversation).not.toBeNull();
-    const storedMessages = await engine
-      .getConversationStore()
-      .getMessages(conversation!.conversationId);
-    expect(storedMessages).toHaveLength(1);
-    expect(storedMessages[0].role).toBe("assistant");
+    expect(conversation).toBeNull();
   });
 
   it("uses explicit compact tokenBudget over legacy tokenBudget", async () => {
@@ -5985,6 +6618,125 @@ describe("LcmContextEngine fidelity and token budget", () => {
       "new question",
       "new answer",
     ]);
+  });
+
+  it("afterTurn skips new-message content already covered by auto-compaction summary", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-overlap";
+    const repeatedInstruction =
+      "kick off workers to review all of these pull requests and report back";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-overlap"),
+      messages: [
+        makeMessage({ role: "user", content: repeatedInstruction }),
+        makeMessage({ role: "assistant", content: "Workers are running now." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: `Summary of compacted context: the user said "${repeatedInstruction}" and the assistant began coordinating the work.`,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      `Summary of compacted context: the user said "${repeatedInstruction}" and the assistant began coordinating the work.`,
+      "Workers are running now.",
+    ]);
+  });
+
+  it("afterTurn does not drop short messages just because they appear in auto-compaction summary", async () => {
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-short-overlap";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-short-overlap"),
+      messages: [
+        makeMessage({ role: "user", content: "yes" }),
+        makeMessage({ role: "assistant", content: "Proceeding." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: "Summary: the user previously said yes to the plan.",
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "Summary: the user previously said yes to the plan.",
+      "yes",
+      "Proceeding.",
+    ]);
+  });
+
+  it("afterTurn keeps a 24+ char user message that only collides as a substring of the summary narrative (F6)", async () => {
+    // PR-6 #566 / F6: bare summary.includes(content) was too loose. A medium-
+    // length user instruction that coincidentally appears inside a long
+    // narrative summary must NOT be silently dropped — only anchored or
+    // quoted matches count as covered.
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-substring-collision";
+    const collidingInstruction = "please update the readme file"; // 30 chars
+    const summary =
+      "Summary of compacted context: the assistant was asked to please " +
+      "update the readme file with new sections, then verify CI passes " +
+      "and report back to the operator before EOD.";
+    expect(summary.toLowerCase()).toContain(collidingInstruction);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-substring-collision"),
+      messages: [
+        makeMessage({ role: "user", content: collidingInstruction }),
+        makeMessage({ role: "assistant", content: "Acknowledged." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: summary,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    // The user instruction must survive: it's only a coincidental substring,
+    // not anchored or quoted.
+    expect(stored.map((message) => message.content)).toEqual([
+      summary,
+      collidingInstruction,
+      "Acknowledged.",
+    ]);
+  });
+
+  it("afterTurn drops a user message when the summary ends with that exact content (F6 anchored)", async () => {
+    // Anchored truth case: content appears at the end of the summary's
+    // normalized text — that's a real coverage signal, drop the dup.
+    const engine = createEngine();
+    const sessionId = "after-turn-summary-suffix-anchored";
+    const repeatedInstruction = "kick off the workers and check back in an hour";
+    const summary = `Summary of compacted context. ${repeatedInstruction}`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-summary-suffix-anchored"),
+      messages: [
+        makeMessage({ role: "user", content: repeatedInstruction }),
+        makeMessage({ role: "assistant", content: "On it." }),
+      ],
+      prePromptMessageCount: 0,
+      autoCompactionSummary: summary,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([summary, "On it."]);
   });
 
   it("afterTurn runs proactive threshold compaction when tokenBudget is provided", async () => {
@@ -6732,6 +7484,296 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(maintenance?.tokenBudget).toBe(400);
   });
 
+  it("afterTurn schedules a deferred drain even when compactionTelemetry has no provider/model (D4)", async () => {
+    // PR-6 #566 / D4: CLI-backend sessions (#472) never observe provider/model
+    // telemetry. Previously the gate at the schedule site silently skipped
+    // and debt accumulated forever. Now we always schedule and let the inner
+    // cache-aware gate decide.
+    const infoLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: infoLog, warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-cli-backend-no-cache-context";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+      scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: true,
+      rawTokensOutsideTail: 50_000,
+      threshold: 20_000,
+    } as unknown as Record<string, unknown>);
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 1_024,
+      threshold: 3_072,
+    });
+    const scheduleSpy = vi.spyOn(privateEngine, "scheduleDeferredCompactionDebtDrain");
+
+    // No legacyCompactionParams provided → updateCompactionTelemetry stores a
+    // record without provider/model — exactly the CLI-backend case.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-cli-backend-no-cache-context"),
+      messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    // Drain MUST be scheduled even though provider/model are unknown.
+    expect(scheduleSpy).toHaveBeenCalledTimes(1);
+    expect(scheduleSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId,
+        reason: "leaf-trigger",
+        tokenBudget: 4_096,
+      }),
+    );
+
+    // The new visibility log should be emitted, not the legacy "not
+    // scheduled" message.
+    const infoMessages = infoLog.mock.calls.map((c) => String(c[0]));
+    expect(
+      infoMessages.some((m) =>
+        m.includes("scheduled without cache context") && m.includes("cache-context-unknown"),
+      ),
+    ).toBe(true);
+    expect(
+      infoMessages.some((m) => m.includes("background deferred compaction not scheduled")),
+    ).toBe(false);
+
+    // And debt is still recorded — that part was already correct.
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation!.conversationId);
+    expect(maintenance?.pending).toBe(true);
+  });
+
+  it("afterTurn caps the transcript-reconcile slow path to one full re-read per session+file (F7)", async () => {
+    // PR-6 #566 / F7: PR #551 added reconcileTranscriptTailForAfterTurn but
+    // its slow path called readLeafPathMessages on the entire session file
+    // every afterTurn when the checkpoint was missing or path-mismatched.
+    // After PR-6: the slow path runs once per (session-key|id, sessionFile),
+    // refreshes the checkpoint, and subsequent afterTurns take the
+    // incremental path or the cap branch.
+    const infoLog = vi.fn();
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: infoLog, warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-reconcile-slow-path-cap";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    // Seed conversation by ingesting one turn through afterTurn first, with
+    // a DIFFERENT sessionFile so the next call has a path-mismatched
+    // checkpoint and is forced into the slow path.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-reconcile-slow-path-seed"),
+      messages: [makeMessage({ role: "assistant", content: "seed turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    // Spy on the (module-scoped) full reader by spying on the slow-path
+    // log, since readLeafPathMessages is a free function. The slow-path warn
+    // is the canonical signal that the full re-read happened.
+    warnLog.mockClear();
+    infoLog.mockClear();
+
+    // First call with a different sessionFile triggers the slow path.
+    // Pre-populate the target sessionFile with at least one historical
+    // message so readLeafPathMessages returns a non-empty list and the
+    // slow-path warn fires (the empty-file branch is a separate exit).
+    const targetSessionFile = createSessionFilePath("after-turn-reconcile-slow-path-target");
+    writeFileSync(
+      targetSessionFile,
+      `${JSON.stringify({
+        message: { role: "user", content: [{ type: "text", text: "historical user line" }] },
+      })}\n`,
+      "utf8",
+    );
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "next turn one" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const slowPathWarns = warnLog.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes("transcript reconcile slow path"));
+    expect(slowPathWarns.length).toBe(1);
+
+    // Second call against the SAME (sessionId, sessionFile) tuple must NOT
+    // re-enter the slow path. After the first slow-path read we refresh the
+    // checkpoint, so this normally goes through the fast (incremental) path
+    // and emits no slow-path warn. If somehow the slow path is reached again
+    // (e.g. checkpoint not append-only-eligible), the cap log fires instead
+    // of a second full re-read.
+    warnLog.mockClear();
+    infoLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "next turn two" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    const secondSlowPathWarns = warnLog.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes("transcript reconcile slow path (full re-read)"));
+    expect(secondSlowPathWarns.length).toBe(0);
+  });
+
+  it("afterTurn retries a capped reconcile when the transcript file changed with an append-only-ineligible suffix (F7)", async () => {
+    const infoLog = vi.fn();
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: infoLog, warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-reconcile-cap-retries-on-file-change";
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluateLeafTrigger: (conversationId: number) => Promise<unknown>;
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluateLeafTrigger").mockResolvedValue({
+      shouldCompact: false,
+      rawTokensOutsideTail: 0,
+      threshold: 20_000,
+    });
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: false,
+      reason: "below threshold",
+      currentTokens: 0,
+      threshold: 3_072,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("after-turn-reconcile-cap-retry-seed"),
+      messages: [makeMessage({ role: "assistant", content: "seed turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    const targetSessionFile = createSessionFilePath("after-turn-reconcile-cap-retry-target");
+    writeFileSync(
+      targetSessionFile,
+      `${JSON.stringify({
+        message: { role: "assistant", content: [{ type: "text", text: "seed turn" }] },
+      })}\n`,
+      "utf8",
+    );
+
+    warnLog.mockClear();
+    infoLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "next turn one" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.includes("transcript reconcile slow path (full re-read)")),
+    ).toHaveLength(1);
+
+    appendFileSync(
+      targetSessionFile,
+      `not-json\n${JSON.stringify({
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "append-only-ineligible user" }],
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    warnLog.mockClear();
+    infoLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: targetSessionFile,
+      messages: [makeMessage({ role: "assistant", content: "append-only-ineligible assistant" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    expect(
+      infoLog.mock.calls
+        .map((c) => String(c[0]))
+        .some((m) => m.includes("transcript reconcile slow path skipped")),
+    ).toBe(false);
+    expect(
+      warnLog.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.includes("transcript reconcile slow path (full re-read)")),
+    ).toHaveLength(1);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed turn",
+      "next turn one",
+      "append-only-ineligible user",
+      "append-only-ineligible assistant",
+    ]);
+
+    const checkpoint = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(checkpoint?.lastProcessedOffset).toBe(statSync(targetSessionFile).size);
+  });
+
   it("afterTurn does not background-compact prompt-mutating debt while Anthropic cache is hot", async () => {
     const engine = createEngine();
     const sessionId = "after-turn-background-hot-cache-deferred";
@@ -6781,7 +7823,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionFile: createSessionFilePath("after-turn-background-hot-cache-deferred"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
       prePromptMessageCount: 0,
-      tokenBudget: 4_096,
+      // Budget chosen so observed input (8K) is far below the critical pressure
+      // ratio (0.70 default). 8K / 200K = 4% — cache-aware path is the only
+      // gate the test should be probing.
+      tokenBudget: 200_000,
       runtimeContext: {
         provider: "anthropic",
         model: "claude-sonnet-4-6",
@@ -6857,7 +7902,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionFile: createSessionFilePath("after-turn-background-codex-cache-write-deferred"),
       messages: [makeMessage({ role: "assistant", content: "fresh turn content" })],
       prePromptMessageCount: 0,
-      tokenBudget: 4_096,
+      // Budget chosen so observed input (8K) is far below the critical pressure
+      // ratio. The test is verifying cache-write-only Codex telemetry remains
+      // mutation-sensitive — keep the budget-pressure escape out of scope.
+      tokenBudget: 200_000,
       runtimeContext: {
         provider: "openai-codex-responses",
         model: "gpt-5.5",
@@ -9251,6 +10299,31 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(stored.map((m) => m.content)).toEqual(["hello", "hi there"]);
   });
 
+  it("does not persist custom transcript context as assistant messages", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-custom-context";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-custom-context"),
+      messages: [
+        {
+          type: "custom_message",
+          customType: "openclaw.runtime-context",
+          content: "Conversation info (untrusted metadata)",
+        } as unknown as AgentMessage,
+        makeMessage({ role: "assistant", content: "real reply" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["real reply"]);
+  });
+
   it("ingests all genuinely new messages (normal afterTurn, no restart)", async () => {
     const engine = createEngine();
     const sessionId = "dedup-normal";
@@ -9605,6 +10678,54 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual(["hello", "world"]);
+  });
+
+  it("fails closed for oversized no-overlap afterTurn batches", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-oversized-no-overlap-fail-closed";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "tool", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    // Simulates a short afterTurn runtime snapshot that has no overlap with
+    // the longer stored LCM conversation. Before this guard, LCM imported the
+    // whole batch as fresh rows and polluted context; the transcript reconcile
+    // path is responsible for genuine missing JSONL tail imports before this
+    // dedup check runs.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed-2"),
+      messages: [
+        makeMessage({ role: "user", content: "unanchored user" }),
+        makeMessage({ role: "assistant", content: "unanchored assistant" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "old C"]);
+    expect(warnLog).toHaveBeenCalledWith(
+      `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — fail-closed skipping full batch`,
+    );
   });
 
   it("preserves a legitimate repeated first new message", async () => {
