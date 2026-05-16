@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import type { ConversationStore, CreateMessagePartInput } from "./store/conversation-store.js";
+import { contentFromParts } from "./assembler.js";
+import type {
+  ConversationStore,
+  CreateMessagePartInput,
+  MessagePartRecord,
+  MessageRecord,
+  MessageRole,
+} from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
@@ -11,6 +18,10 @@ import { LcmProviderAuthError } from "./summarize.js";
 export interface CompactionDecision {
   shouldCompact: boolean;
   reason: "threshold" | "manual" | "none";
+  /** Persisted Lossless context tokens before runtime prompt overhead. */
+  storedTokens: number;
+  /** Runtime-observed prompt tokens, when supplied by the host. */
+  observedTokens?: number;
   currentTokens: number;
   threshold: number;
 }
@@ -194,7 +205,21 @@ const MEDIA_ATTACHMENT_PART_TYPES = new Set(["file", "snapshot"]);
 const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
 const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
-const STRUCTURED_MEDIA_NESTED_KEYS = ["content", "parts", "items", "message", "messages"] as const;
+const STRUCTURED_MEDIA_NESTED_KEYS = [
+  "content",
+  "parts",
+  "items",
+  "message",
+  "messages",
+  "input",
+  "arguments",
+  "output",
+  "result",
+  "results",
+  "data",
+  "query",
+  "command",
+] as const;
 
 const CONDENSED_MIN_INPUT_RATIO = 0.1;
 
@@ -334,6 +359,74 @@ function extractMeaningfulMessageText(content: string): string {
   return stripEmbeddedMediaPayloads(content);
 }
 
+/** Map stored message roles back to runtime roles for structured reconstruction. */
+function runtimeRoleForSummary(role: MessageRole): "user" | "assistant" | "toolResult" {
+  if (role === "tool") {
+    return "toolResult";
+  }
+  if (role === "user" || role === "system") {
+    return "user";
+  }
+  return "assistant";
+}
+
+/** Parse JSON-ish message-part values while preserving plain text values. */
+function parseStoredPartValue(value: string | null | undefined): unknown {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return trimmed;
+  }
+}
+
+/** Extract summarizable text from a structured runtime content value. */
+function extractMeaningfulStructuredText(value: unknown): string {
+  if (typeof value === "string") {
+    return extractMeaningfulMessageText(value);
+  }
+  const extracted = extractSanitizedStructuredText(value)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean);
+  if (extracted.length > 0) {
+    return extracted.join("\n").trim();
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? extractMeaningfulMessageText(serialized) : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Extract a readable fallback from one structured message part. */
+function extractMessagePartSummaryText(part: MessagePartRecord): string {
+  const sections: string[] = [];
+  const text = extractMeaningfulStructuredText(part.textContent);
+  if (text) {
+    sections.push(text);
+  }
+
+  const toolName = part.toolName?.trim();
+  const toolLabel = toolName ? ` (${toolName})` : "";
+  const input = extractMeaningfulStructuredText(parseStoredPartValue(part.toolInput));
+  if (input) {
+    sections.push(`Tool input${toolLabel}:\n${input}`);
+  }
+  const output = extractMeaningfulStructuredText(parseStoredPartValue(part.toolOutput));
+  if (output) {
+    sections.push(`Tool output${toolLabel}:\n${output}`);
+  }
+
+  return sections.join("\n\n").trim();
+}
+
 /** Identify whether a stored message part represents a media attachment. */
 function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string; metadata: string | null }): boolean {
   if (MEDIA_ATTACHMENT_PART_TYPES.has(part.partType)) {
@@ -428,6 +521,8 @@ export class CompactionEngine {
       return {
         shouldCompact: true,
         reason: "threshold",
+        storedTokens,
+        ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
         currentTokens,
         threshold,
       };
@@ -436,6 +531,8 @@ export class CompactionEngine {
     return {
       shouldCompact: false,
       reason: "none",
+      storedTokens,
+      ...(liveTokens > 0 ? { observedTokens: liveTokens } : {}),
       currentTokens,
       threshold,
     };
@@ -472,6 +569,8 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    /** Optional persisted-context target used when host runtime overhead is known. */
+    stopAtTokens?: number;
     summaryModel?: string;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this.compactFullSweep(input));
@@ -635,14 +734,26 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
+    /** Optional persisted-context target used when host runtime overhead is known. */
+    stopAtTokens?: number;
     summaryModel?: string;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
     const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const stopAtTokens =
+      typeof input.stopAtTokens === "number" &&
+      Number.isFinite(input.stopAtTokens) &&
+      input.stopAtTokens > 0
+        ? Math.floor(input.stopAtTokens)
+        : undefined;
 
-    if (!force && tokensBefore <= threshold) {
+    if (
+      !force &&
+      tokensBefore <= threshold &&
+      (stopAtTokens === undefined || tokensBefore <= stopAtTokens)
+    ) {
       return {
         actionTaken: false,
         tokensBefore,
@@ -708,10 +819,6 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
-      if (!force && passTokensAfter <= threshold) {
-        previousTokens = passTokensAfter;
-        break;
-      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -723,6 +830,10 @@ export class CompactionEngine {
     const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(tokenBudget);
     const hasSummaryPrefixPressure = async (): Promise<boolean> =>
       (await this.countSummaryTokensOutsideFreshTail(conversationId)) > summaryPrefixTargetTokens;
+    const hasStopTargetPressure = (): boolean =>
+      stopAtTokens !== undefined && runningTokens > stopAtTokens;
+    const hasCondensationPressure = async (): Promise<boolean> =>
+      hasStopTargetPressure() || await hasSummaryPrefixPressure();
 
     const runCondensationPass = async (params: {
       enforcePreferredDepth: boolean;
@@ -767,6 +878,10 @@ export class CompactionEngine {
       level = condenseResult.level;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== undefined && passTokensAfter <= stopAtTokens) {
+        previousTokens = passTokensAfter;
+        return "progress";
+      }
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
         return "progress";
@@ -778,7 +893,7 @@ export class CompactionEngine {
       return "progress";
     };
 
-    while (force || previousTokens > threshold || await hasSummaryPrefixPressure()) {
+    while (await hasCondensationPressure()) {
       const status = await runCondensationPass({
         enforcePreferredDepth: true,
         useHardFanout: hardTrigger === true,
@@ -794,7 +909,7 @@ export class CompactionEngine {
     while (
       !hadAuthFailure &&
       !stoppedForNoProgress &&
-      (previousTokens > threshold || await hasSummaryPrefixPressure())
+      await hasCondensationPressure()
     ) {
       const status = await runCondensationPass({
         enforcePreferredDepth: false,
@@ -1527,8 +1642,9 @@ export class CompactionEngine {
   private async annotateMediaContent(
     messageId: number,
     content: string,
+    preloadedParts?: MessagePartRecord[],
   ): Promise<string> {
-    const parts = await this.conversationStore.getMessageParts(messageId);
+    const parts = preloadedParts ?? (await this.conversationStore.getMessageParts(messageId));
     const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
     if (!hasMediaParts) {
       return content;
@@ -1554,6 +1670,48 @@ export class CompactionEngine {
     return `${meaningfulText} [with media attachment]`;
   }
 
+  /**
+   * Reconstruct the text used by leaf summaries from stored message data.
+   *
+   * Plain `messages.content` is preferred when present, but structured tool
+   * calls/results often store their actual payload in `message_parts` while the
+   * fallback content column is empty. Rehydrating through the assembler helper
+   * keeps compaction aligned with the prompt assembly path.
+   */
+  private async resolveLeafSummaryMessageContent(msg: MessageRecord): Promise<string> {
+    const parts = await this.conversationStore.getMessageParts(msg.messageId);
+    const annotatedContent = await this.annotateMediaContent(
+      msg.messageId,
+      msg.content,
+      parts,
+    );
+    const storedText = extractMeaningfulMessageText(annotatedContent);
+    if (storedText) {
+      return storedText;
+    }
+
+    if (parts.length === 0) {
+      return "";
+    }
+
+    const rehydrated = contentFromParts(
+      parts.map((part) => ({ ...part })),
+      runtimeRoleForSummary(msg.role),
+      msg.content,
+    );
+    const rehydratedText = extractMeaningfulStructuredText(rehydrated);
+    if (rehydratedText) {
+      return rehydratedText;
+    }
+
+    return parts
+      .map(extractMessagePartSummaryText)
+      .map((text) => text.trim())
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+  }
+
   // ── Private: Leaf Pass ───────────────────────────────────────────────────
 
   /**
@@ -1575,13 +1733,9 @@ export class CompactionEngine {
       }
       const msg = await this.conversationStore.getMessageById(item.messageId);
       if (msg) {
-        const annotatedContent = await this.annotateMediaContent(
-          msg.messageId,
-          msg.content,
-        );
         messageContents.push({
           messageId: msg.messageId,
-          content: annotatedContent,
+          content: await this.resolveLeafSummaryMessageContent(msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
         });

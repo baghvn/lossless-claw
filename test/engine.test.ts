@@ -5434,6 +5434,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual([{ role: "user", content: "first turn" }]);
     expect(result.estimatedTokens).toBe(0);
+    expect(result.contextProjection).toBeUndefined();
   });
 
   it("falls back when DB context clearly trails live context", async () => {
@@ -5459,6 +5460,7 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages).not.toBe(liveMessages);
     expect(result.messages).toStrictEqual(liveMessages);
     expect(result.estimatedTokens).toBe(0);
+    expect(result.contextProjection).toBeUndefined();
   });
 
   it("assembles context from DB when coverage exists", async () => {
@@ -5487,6 +5489,90 @@ describe("LcmContextEngine.assemble canonical path", () => {
     expect(result.messages[0].content).toBe("persisted message one");
     expect(result.messages[1].role).toBe("assistant");
     expect(result.estimatedTokens).toBeGreaterThan(0);
+    expect(result.contextProjection).toEqual({
+      mode: "thread_bootstrap",
+      epoch: expect.stringMatching(/^summary-prefix-v1:\d+:[a-f0-9]{32}$/),
+    });
+  });
+
+  it("logs the emitted context projection epoch", async () => {
+    const infoLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: infoLog,
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "session-projection-log";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message one" } as AgentMessage,
+    });
+    const result = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+
+    const assembleDoneLog = infoLog.mock.calls
+      .map((call: unknown[]) => call[0])
+      .find((entry: unknown) => typeof entry === "string" && entry.includes("[lcm] assemble: done"));
+    expect(assembleDoneLog).toEqual(expect.any(String));
+    expect(assembleDoneLog).toContain("contextProjectionMode=thread_bootstrap");
+    expect(assembleDoneLog).toContain(`contextProjectionEpoch=${result.contextProjection?.epoch}`);
+    expect(assembleDoneLog).toContain("summaryContextItems=0");
+  });
+
+  it("keeps projection epochs stable across raw tail growth and changes them for summaries", async () => {
+    const engine = createEngine();
+    const sessionId = "session-projection-epoch";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "persisted message one" } as AgentMessage,
+    });
+    const first = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(first.contextProjection?.mode).toBe("thread_bootstrap");
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "persisted message two" } as AgentMessage,
+    });
+    const afterRawTail = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(afterRawTail.contextProjection?.epoch).toBe(first.contextProjection?.epoch);
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    await engine.getSummaryStore().insertSummary({
+      summaryId: "sum_projection_epoch",
+      conversationId: conversation!.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "Summary projection content",
+      tokenCount: 8,
+      descendantCount: 0,
+    });
+    await engine
+      .getSummaryStore()
+      .appendContextSummary(conversation!.conversationId, "sum_projection_epoch");
+
+    const afterSummary = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(afterSummary.contextProjection?.epoch).not.toBe(first.contextProjection?.epoch);
   });
 
   it("respects token budget in assembled output", async () => {
@@ -9010,8 +9096,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
       expect.objectContaining({
         conversationId: conversation.conversationId,
         tokenBudget: 4_096,
-        force: false,
+        force: true,
         hardTrigger: false,
+        stopAtTokens: 1,
       }),
     );
     expect(maintenance?.pending).toBe(true);
@@ -10481,6 +10568,126 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
         summarize: expect.any(Function),
         force: false,
         hardTrigger: false,
+      }),
+    );
+  });
+
+  it("forces threshold sweeps to account for runtime prompt overhead", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens: 7_000,
+      observedTokens: 12_000,
+      currentTokens: 12_000,
+      threshold: 8_200,
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: 7_000,
+        tokensAfter: 3_200,
+        condensed: false,
+      });
+
+    await engine.ingest({
+      sessionId: "threshold-runtime-overhead-session",
+      message: { role: "user", content: "trigger threshold compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "threshold-runtime-overhead-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 10_000,
+      currentTokenCount: 12_000,
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted");
+    expect(compactFullSweepSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: expect.any(Number),
+        tokenBudget: 10_000,
+        summarize: expect.any(Function),
+        force: true,
+        hardTrigger: false,
+        stopAtTokens: 3_200,
+      }),
+    );
+    expect(result.result?.details).toEqual(
+      expect.objectContaining({
+        targetTokens: 3_200,
+        observedOverheadTokens: 5_000,
+        projectedTokensAfter: 8_200,
+      }),
+    );
+  });
+
+  it("does not clear threshold pressure when persisted tokens are under target but runtime tokens remain over", async () => {
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+      };
+    };
+
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens: 7_000,
+      observedTokens: 12_000,
+      currentTokens: 12_000,
+      threshold: 8_200,
+    });
+    vi.spyOn(privateEngine.compaction, "compactFullSweep").mockResolvedValue({
+      actionTaken: false,
+      tokensBefore: 7_000,
+      tokensAfter: 7_000,
+      condensed: false,
+    });
+
+    await engine.ingest({
+      sessionId: "threshold-runtime-still-over-session",
+      message: { role: "user", content: "trigger threshold compact" } as AgentMessage,
+    });
+
+    const result = await engine.compact({
+      sessionId: "threshold-runtime-still-over-session",
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 10_000,
+      currentTokenCount: 12_000,
+      compactionTarget: "threshold",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("live context still exceeds target");
+    expect(result.result?.tokensBefore).toBe(12_000);
+    expect(result.result?.tokensAfter).toBe(7_000);
+    expect(result.result?.details).toEqual(
+      expect.objectContaining({
+        targetTokens: 3_200,
+        observedOverheadTokens: 5_000,
+        projectedTokensAfter: 12_000,
       }),
     );
   });
